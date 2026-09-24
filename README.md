@@ -3,6 +3,9 @@
 用 **PortGPT** 把 Android 16（AOSP16）的安全修复补丁移植到 Android 12（AOSP12）的实测结果，
 共 7 个 CVE。每个 CVE 一个目录，目录里放四样东西。
 
+> **实验过程中遇到的所有问题**（网络中断、仓库历史缺失、工具崩溃、"假成功"等）
+> **以及对 PortGPT 源码做了哪些改动**，见 **[EXPERIMENT-NOTES.md](./EXPERIMENT-NOTES.md)**。
+
 ---
 
 ## 每个 CVE 目录里的四样东西
