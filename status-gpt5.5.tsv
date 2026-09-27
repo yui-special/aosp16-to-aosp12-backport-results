@@ -1,0 +1,6 @@
+case	model	verdict	compile	fix_rounds	llm_calls	duration	files	note
+CVE-2026-0045 (path-mapped sim)	gpt-5.5	Successfully	PASS	0	22	100s	1	patch is semantically equivalent to the AOSP16 fix; placed inside LINK_KEY_KNOWN branch
+CVE-2026-0045 (original case)	gpt-5.5	CRASH	-	0	1	20s	0	git merge-base is empty (cross-repo); tool cannot run
+CVE-2025-48649	gpt-5.5	ABORTED	-	0	149	1080s	0	aborted at hunk 11 (iteration budget exhausted); never reached compile stage
+CVE-2026-46054 (attempt 1)	gpt-5.5	ABORTED	-	0	99	660s	0	HTTP 400 GR_CONTENT_POLICY_VIOLATION from the endpoint
+CVE-2026-46054 (attempt 2)	gpt-5.5	IN PROGRESS	-	-	-	-	-	running at the time of this upload
