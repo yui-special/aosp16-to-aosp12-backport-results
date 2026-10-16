@@ -1,0 +1,171 @@
+{
+  "schema": "portgpt.group_task/v1",
+  "agent_version": "1.0.0",
+  "analysis_version": "1.0",
+  "generated_at": "2026-10-14T06:23:08+00:00",
+  "patch_id": "independent_hunks",
+  "source_revision": "SRC",
+  "target_revision": "TGT",
+  "grouping_status": "complete",
+  "validation": {
+    "all_hunks_assigned_once": true,
+    "strong_dependencies_within_groups": true,
+    "unresolved_dependencies_reported": true
+  },
+  "caveats": [
+    "Dependency records are LLM-proposed and only structurally validated.",
+    "They are not verified backport results and must not be reported as such.",
+    "STRONG dependencies mean the hunks are intended to be ported together; they do not prove that the port is correct.",
+    "Unresolved questions are listed per group and may indicate missing context."
+  ],
+  "group_count": 2,
+  "groups": [
+    {
+      "group_id": "G1",
+      "hunk_ids": [
+        "H1"
+      ],
+      "must_port_together": false,
+      "group_reason": "No strong dependency connects H1 to another hunk, so it forms its own group.",
+      "dependencies": [],
+      "attention_points": [],
+      "unresolved_questions": [],
+      "hunks": [
+        {
+          "hunk_id": "H1",
+          "file_path": "src/cache.c",
+          "target_file_path": "src/cache.c",
+          "header": "@@ -1,4 +1,4 @@ static void log_hit(void)",
+          "old_start": 1,
+          "old_count": 4,
+          "new_start": 1,
+          "new_count": 4,
+          "section": "static void log_hit(void)",
+          "added_lines": [
+            "    log_debug(\"cache hit (fast path)\");"
+          ],
+          "removed_lines": [
+            "    log_debug(\"cache hit\");"
+          ],
+          "context_lines": [
+            "static void log_hit(void)",
+            "{",
+            "}"
+          ],
+          "diff_text": "@@ -1,4 +1,4 @@ static void log_hit(void)\n static void log_hit(void)\n {\n-    log_debug(\"cache hit\");\n+    log_debug(\"cache hit (fast path)\");\n }",
+          "source_context": {
+            "available": true,
+            "code": "static void log_hit(void)\n{\n}\n-     log_debug(\"cache hit\");",
+            "origin": "diff_hunk",
+            "file_path": "src/cache.c",
+            "line_start": null,
+            "line_end": null,
+            "scope_function": "log_hit",
+            "truncated": false,
+            "reason": "file not found at revision 'SRC'"
+          },
+          "target_context": {
+            "available": true,
+            "code": "static void log_hit(void)\n{\n}\n+     log_debug(\"cache hit (fast path)\");",
+            "origin": "diff_hunk",
+            "file_path": "src/cache.c",
+            "line_start": null,
+            "line_end": null,
+            "scope_function": "log_hit",
+            "truncated": false,
+            "reason": "file not found at revision 'TGT'"
+          },
+          "target_symbol_status": {
+            "log_hit": "absent",
+            "log_debug": "partially_present"
+          },
+          "retrieval_status": "unavailable"
+        }
+      ],
+      "missing_hunks": []
+    },
+    {
+      "group_id": "G2",
+      "hunk_ids": [
+        "H2"
+      ],
+      "must_port_together": false,
+      "group_reason": "No strong dependency connects H2 to another hunk, so it forms its own group.",
+      "dependencies": [],
+      "attention_points": [],
+      "unresolved_questions": [],
+      "hunks": [
+        {
+          "hunk_id": "H2",
+          "file_path": "src/cache.c",
+          "target_file_path": "src/cache.c",
+          "header": "@@ -6,5 +6,5 @@ static int cache_lookup(int key)",
+          "old_start": 6,
+          "old_count": 5,
+          "new_start": 6,
+          "new_count": 5,
+          "section": "static int cache_lookup(int key)",
+          "added_lines": [
+            "    return slot >= 0 ? table[slot] : -1;"
+          ],
+          "removed_lines": [
+            "    return table[slot];"
+          ],
+          "context_lines": [
+            "static int cache_lookup(int key)",
+            "{",
+            "    int slot = hash(key);",
+            "}"
+          ],
+          "diff_text": "@@ -6,5 +6,5 @@ static int cache_lookup(int key)\n static int cache_lookup(int key)\n {\n     int slot = hash(key);\n-    return table[slot];\n+    return slot >= 0 ? table[slot] : -1;\n }",
+          "source_context": {
+            "available": true,
+            "code": "static int cache_lookup(int key)\n{\n    int slot = hash(key);\n}\n-     return table[slot];",
+            "origin": "diff_hunk",
+            "file_path": "src/cache.c",
+            "line_start": null,
+            "line_end": null,
+            "scope_function": "cache_lookup",
+            "truncated": false,
+            "reason": "file not found at revision 'SRC'"
+          },
+          "target_context": {
+            "available": true,
+            "code": "static int cache_lookup(int key)\n{\n    int slot = hash(key);\n}\n+     return slot >= 0 ? table[slot] : -1;",
+            "origin": "diff_hunk",
+            "file_path": "src/cache.c",
+            "line_start": null,
+            "line_end": null,
+            "scope_function": "cache_lookup",
+            "truncated": false,
+            "reason": "file not found at revision 'TGT'"
+          },
+          "target_symbol_status": {
+            "cache_lookup": "absent",
+            "hash": "absent",
+            "slot": "absent",
+            "key": "absent",
+            "table": "absent"
+          },
+          "retrieval_status": "unavailable"
+        }
+      ],
+      "missing_hunks": []
+    }
+  ],
+  "traceability_template": {
+    "patch_id": "independent_hunks",
+    "agent_version": "1.0.0",
+    "analysis_version": "1.0",
+    "source_revision": "SRC",
+    "target_revision": "TGT",
+    "group_ids": [
+      "G1",
+      "G2"
+    ],
+    "hunk_ids": [
+      "H1",
+      "H2"
+    ]
+  }
+}
