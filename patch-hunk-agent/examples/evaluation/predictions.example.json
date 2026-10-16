@@ -1,0 +1,30 @@
+{
+  "predictions": [
+    {
+      "patch_id": "sample",
+      "analysis": {
+        "dependencies": [
+          {
+            "source_hunk": "H1",
+            "target_hunk": "H2",
+            "category": "DEFINITION_USE",
+            "strength": "STRONG"
+          },
+          {
+            "source_hunk": "H3",
+            "target_hunk": "H4",
+            "category": "INTERFACE_SIGNATURE",
+            "strength": "STRONG"
+          }
+        ]
+      },
+      "grouping": {
+        "groups": [
+          {"group_id": "G1", "hunk_ids": ["H1", "H2"]},
+          {"group_id": "G2", "hunk_ids": ["H3", "H4"]}
+        ]
+      },
+      "grouping_document": {"status": "complete"}
+    }
+  ]
+}
