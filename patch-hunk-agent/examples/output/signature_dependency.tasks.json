@@ -1,0 +1,186 @@
+{
+  "schema": "portgpt.group_task/v1",
+  "agent_version": "1.0.0",
+  "analysis_version": "1.0",
+  "generated_at": "2026-10-14T06:23:08+00:00",
+  "patch_id": "signature_dependency",
+  "source_revision": "SRC",
+  "target_revision": "TGT",
+  "grouping_status": "complete",
+  "validation": {
+    "all_hunks_assigned_once": true,
+    "strong_dependencies_within_groups": true,
+    "unresolved_dependencies_reported": true
+  },
+  "caveats": [
+    "Dependency records are LLM-proposed and only structurally validated.",
+    "They are not verified backport results and must not be reported as such.",
+    "STRONG dependencies mean the hunks are intended to be ported together; they do not prove that the port is correct.",
+    "Unresolved questions are listed per group and may indicate missing context."
+  ],
+  "group_count": 1,
+  "groups": [
+    {
+      "group_id": "G1",
+      "hunk_ids": [
+        "H1",
+        "H2"
+      ],
+      "must_port_together": true,
+      "group_reason": "H1, H2 must be ported together because of verified STRONG dependency(ies): D1 (INTERFACE_SIGNATURE H2->H1): Machine signal signature_change on symbol process; target version state reported as absent.",
+      "dependencies": [
+        {
+          "dependency_id": "D1",
+          "source_hunk": "H2",
+          "target_hunk": "H1",
+          "category": "INTERFACE_SIGNATURE",
+          "strength": "STRONG",
+          "evidence": [
+            {
+              "file_path": "src/caller.c",
+              "symbol": "process",
+              "description": "H2 changes the signature of process ((int x) -> (int x, int flags)) and H1 uses it.",
+              "line": 20
+            }
+          ],
+          "separation_risk": "Backporting only one side leaves the caller and the definition with mismatched parameter lists, which breaks compilation or silently changes behaviour.",
+          "target_version_status": "absent",
+          "reasoning_summary": "Machine signal signature_change on symbol process; target version state reported as absent.",
+          "needs_more_evidence": false,
+          "origin": "heuristic_mock"
+        }
+      ],
+      "attention_points": [
+        "D1 STRONG INTERFACE_SIGNATURE (H2<->H1): update every caller and the definition in the same step for process."
+      ],
+      "unresolved_questions": [],
+      "hunks": [
+        {
+          "hunk_id": "H1",
+          "file_path": "src/caller.c",
+          "target_file_path": "src/caller.c",
+          "header": "@@ -4,6 +4,6 @@ void run(void)",
+          "old_start": 4,
+          "old_count": 6,
+          "new_start": 4,
+          "new_count": 6,
+          "section": "void run(void)",
+          "added_lines": [
+            "    process(value, DEFAULT_FLAGS);"
+          ],
+          "removed_lines": [
+            "    process(value);"
+          ],
+          "context_lines": [
+            "void run(void)",
+            "{",
+            "    int value = read_input();",
+            "    return;",
+            "}"
+          ],
+          "diff_text": "@@ -4,6 +4,6 @@ void run(void)\n void run(void)\n {\n     int value = read_input();\n-    process(value);\n+    process(value, DEFAULT_FLAGS);\n     return;\n }",
+          "source_context": {
+            "available": true,
+            "code": "#include \"process.h\"\n\nvoid run(void)\n{\n    int value = read_input();\n    process(value);\n    return;\n}",
+            "origin": "repository",
+            "file_path": "src/caller.c",
+            "line_start": 1,
+            "line_end": 8,
+            "scope_function": "run",
+            "truncated": false
+          },
+          "target_context": {
+            "available": true,
+            "code": "#include \"process.h\"\n\nvoid run(void)\n{\n    int value = read_input();\n    process(value);\n    return;\n}",
+            "origin": "repository",
+            "file_path": "src/caller.c",
+            "line_start": 1,
+            "line_end": 8,
+            "scope_function": "run",
+            "truncated": false
+          },
+          "target_symbol_status": {
+            "run": "present",
+            "read_input": "partially_present",
+            "process": "present",
+            "value": "present",
+            "DEFAULT_FLAGS": "absent"
+          },
+          "retrieval_status": "complete"
+        },
+        {
+          "hunk_id": "H2",
+          "file_path": "src/process.c",
+          "target_file_path": "src/process.c",
+          "header": "@@ -20,5 +20,8 @@ int process(int x)",
+          "old_start": 20,
+          "old_count": 5,
+          "new_start": 20,
+          "new_count": 8,
+          "section": "int process(int x)",
+          "added_lines": [
+            "int process(int x, int flags)",
+            "    if (flags & PROCESS_STRICT) {",
+            "        scaled = check_bounds(scaled);",
+            "    }"
+          ],
+          "removed_lines": [
+            "int process(int x)"
+          ],
+          "context_lines": [
+            "{",
+            "    int scaled = x * factor;",
+            "    return scaled;",
+            "}"
+          ],
+          "diff_text": "@@ -20,5 +20,8 @@ int process(int x)\n-int process(int x)\n+int process(int x, int flags)\n {\n     int scaled = x * factor;\n+    if (flags & PROCESS_STRICT) {\n+        scaled = check_bounds(scaled);\n+    }\n     return scaled;\n }",
+          "source_context": {
+            "available": true,
+            "code": "#include \"process.h\"\n\nstatic int factor = 3;\n\nstatic int check_bounds(int value)\n{\n    if (value > 1000) {\n        return 1000;\n    }\n    return value;\n}\n\nstatic int clamp_value(int value, int limit)\n{\n    return value > limit ? limit : value;\n}\n\nint process(int x)\n{\n    int scaled = x * factor;\n    return scaled;\n}",
+            "origin": "repository",
+            "file_path": "src/process.c",
+            "line_start": 1,
+            "line_end": 22,
+            "scope_function": "process",
+            "truncated": false
+          },
+          "target_context": {
+            "available": true,
+            "code": "#include \"process.h\"\n\nstatic int factor = 2;\n\nint process(int x)\n{\n    int scaled = x * factor;\n    return scaled;\n}",
+            "origin": "repository",
+            "file_path": "src/process.c",
+            "line_start": 1,
+            "line_end": 9,
+            "scope_function": "process",
+            "truncated": false
+          },
+          "target_symbol_status": {
+            "process": "absent",
+            "check_bounds": "absent",
+            "scaled": "present",
+            "x": "partially_present",
+            "flags": "absent",
+            "factor": "present",
+            "PROCESS_STRICT": "absent"
+          },
+          "retrieval_status": "complete"
+        }
+      ],
+      "missing_hunks": []
+    }
+  ],
+  "traceability_template": {
+    "patch_id": "signature_dependency",
+    "agent_version": "1.0.0",
+    "analysis_version": "1.0",
+    "source_revision": "SRC",
+    "target_revision": "TGT",
+    "group_ids": [
+      "G1"
+    ],
+    "hunk_ids": [
+      "H1",
+      "H2"
+    ]
+  }
+}
