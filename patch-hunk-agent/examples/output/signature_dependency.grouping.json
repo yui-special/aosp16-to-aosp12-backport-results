@@ -1,0 +1,123 @@
+{
+  "patch_id": "signature_dependency",
+  "status": "complete",
+  "groups": [
+    {
+      "group_id": "G1",
+      "group_reason": "H1, H2 must be ported together because of verified STRONG dependency(ies): D1 (INTERFACE_SIGNATURE H2->H1): Machine signal signature_change on symbol process; target version state reported as absent.",
+      "dependency_ids": [
+        "D1"
+      ],
+      "other_dependency_ids": [],
+      "external_dependency_ids": [],
+      "hunk_ids": [
+        "H1",
+        "H2"
+      ]
+    }
+  ],
+  "cross_group_dependencies": [],
+  "unresolved_questions": [],
+  "validation": {
+    "all_hunks_assigned_once": true,
+    "strong_dependencies_within_groups": true,
+    "unresolved_dependencies_reported": true
+  },
+  "metadata": {
+    "analysis_version": "1.0",
+    "provider": "mock-heuristic",
+    "model": "mock-heuristic",
+    "dependency_validation": {
+      "dependency_count": 1,
+      "by_strength": {
+        "STRONG": 1
+      },
+      "by_category": {
+        "INTERFACE_SIGNATURE": 1
+      },
+      "rejected_count": 0,
+      "warning_count": 1,
+      "downgrade_count": 0
+    },
+    "grouping": {
+      "hunk_count": 2,
+      "group_count": 1,
+      "group_sizes": [
+        2
+      ],
+      "strong_edge_count": 1,
+      "promotions": [],
+      "not_promoted": [],
+      "ignored_edges": [],
+      "graph": {
+        "node_count": 2,
+        "edge_count": 1,
+        "components": 1,
+        "edge_strengths": [
+          "STRONG"
+        ],
+        "isolated_hunks": [],
+        "ignored_edges": [],
+        "edges": [
+          {
+            "dependency_id": "D1",
+            "pair": [
+              "H1",
+              "H2"
+            ],
+            "strength": "STRONG",
+            "category": "INTERFACE_SIGNATURE"
+          }
+        ]
+      },
+      "degree_stats": {
+        "max_degree": 1,
+        "isolated_count": 0,
+        "degrees": {
+          "H1": 1,
+          "H2": 1
+        }
+      },
+      "effective_strengths": {
+        "D1": "STRONG"
+      },
+      "weak_dependencies_not_merged": []
+    },
+    "analysis_status": "complete",
+    "usage": {
+      "prompt_tokens": 18263,
+      "completion_tokens": 339,
+      "total_tokens": 18602,
+      "calls": 2,
+      "failed_calls": 0,
+      "estimated": true
+    }
+  },
+  "errors": [],
+  "warnings": [
+    {
+      "reason": "record_contradicts_retrieved_context",
+      "pair": [
+        "H2",
+        "H1"
+      ],
+      "symbol": "process",
+      "record_status": "absent",
+      "observed_status": "present",
+      "hunk_id": "H1",
+      "detail": "the retrieved target code suggests a different target-version state than the dependency record claims"
+    }
+  ],
+  "checks": {
+    "expected_hunk_count": 2,
+    "assigned_hunk_count": 2,
+    "group_count": 1,
+    "group_sizes": [
+      2
+    ],
+    "strong_dependency_count": 1,
+    "unresolved_question_count": 0,
+    "affected_groups": [],
+    "analysis_status": "complete"
+  }
+}
