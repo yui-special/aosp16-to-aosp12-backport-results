@@ -1,0 +1,133 @@
+{
+  "cases": [
+    {
+      "patch_id": "simple_dependency",
+      "status": "complete",
+      "groups": [
+        {
+          "group_id": "G1",
+          "hunk_ids": [
+            "H1",
+            "H2"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "dependency_id": "D1",
+          "pair": [
+            "H1",
+            "H2"
+          ],
+          "category": "DEFINITION_USE",
+          "strength": "STRONG",
+          "target_version_status": "absent"
+        }
+      ]
+    },
+    {
+      "patch_id": "signature_dependency",
+      "status": "complete",
+      "groups": [
+        {
+          "group_id": "G1",
+          "hunk_ids": [
+            "H1",
+            "H2"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "dependency_id": "D1",
+          "pair": [
+            "H2",
+            "H1"
+          ],
+          "category": "INTERFACE_SIGNATURE",
+          "strength": "STRONG",
+          "target_version_status": "absent"
+        }
+      ]
+    },
+    {
+      "patch_id": "independent_hunks",
+      "status": "complete",
+      "groups": [
+        {
+          "group_id": "G1",
+          "hunk_ids": [
+            "H1"
+          ]
+        },
+        {
+          "group_id": "G2",
+          "hunk_ids": [
+            "H2"
+          ]
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "patch_id": "target_already_satisfies",
+      "status": "complete",
+      "groups": [
+        {
+          "group_id": "G1",
+          "hunk_ids": [
+            "H1"
+          ]
+        },
+        {
+          "group_id": "G2",
+          "hunk_ids": [
+            "H2"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "dependency_id": "D1",
+          "pair": [
+            "H1",
+            "H2"
+          ],
+          "category": "DEFINITION_USE",
+          "strength": "CONDITIONAL",
+          "target_version_status": "present"
+        }
+      ]
+    },
+    {
+      "patch_id": "insufficient_evidence",
+      "status": "partial",
+      "groups": [
+        {
+          "group_id": "G1",
+          "hunk_ids": [
+            "H1"
+          ]
+        },
+        {
+          "group_id": "G2",
+          "hunk_ids": [
+            "H2"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "dependency_id": "D1",
+          "pair": [
+            "H1",
+            "H2"
+          ],
+          "category": "DEFINITION_USE",
+          "strength": "CONDITIONAL",
+          "target_version_status": "unknown"
+        }
+      ]
+    }
+  ]
+}
