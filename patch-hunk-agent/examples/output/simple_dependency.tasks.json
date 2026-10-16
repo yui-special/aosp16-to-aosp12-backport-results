@@ -1,0 +1,182 @@
+{
+  "schema": "portgpt.group_task/v1",
+  "agent_version": "1.0.0",
+  "analysis_version": "1.0",
+  "generated_at": "2026-10-14T06:23:08+00:00",
+  "patch_id": "simple_dependency",
+  "source_revision": "SRC",
+  "target_revision": "TGT",
+  "grouping_status": "complete",
+  "validation": {
+    "all_hunks_assigned_once": true,
+    "strong_dependencies_within_groups": true,
+    "unresolved_dependencies_reported": true
+  },
+  "caveats": [
+    "Dependency records are LLM-proposed and only structurally validated.",
+    "They are not verified backport results and must not be reported as such.",
+    "STRONG dependencies mean the hunks are intended to be ported together; they do not prove that the port is correct.",
+    "Unresolved questions are listed per group and may indicate missing context."
+  ],
+  "group_count": 1,
+  "groups": [
+    {
+      "group_id": "G1",
+      "hunk_ids": [
+        "H1",
+        "H2"
+      ],
+      "must_port_together": true,
+      "group_reason": "H1, H2 must be ported together because of verified STRONG dependency(ies): D1 (DEFINITION_USE H1->H2): Machine signal definition_use on symbol clamp_value; target version state reported as absent.",
+      "dependencies": [
+        {
+          "dependency_id": "D1",
+          "source_hunk": "H1",
+          "target_hunk": "H2",
+          "category": "DEFINITION_USE",
+          "strength": "STRONG",
+          "evidence": [
+            {
+              "file_path": "src/example.c",
+              "symbol": "clamp_value",
+              "description": "H1 defines clamp_value and H2 references it (call).",
+              "line": 8
+            }
+          ],
+          "separation_risk": "The reference may remain unresolved if the definition is not ported with it.",
+          "target_version_status": "absent",
+          "reasoning_summary": "Machine signal definition_use on symbol clamp_value; target version state reported as absent.",
+          "needs_more_evidence": false,
+          "origin": "heuristic_mock"
+        }
+      ],
+      "attention_points": [
+        "D1 STRONG DEFINITION_USE (H1<->H2): port the definition and its use together for clamp_value."
+      ],
+      "unresolved_questions": [],
+      "hunks": [
+        {
+          "hunk_id": "H1",
+          "file_path": "src/example.c",
+          "target_file_path": "src/example.c",
+          "header": "@@ -6,3 +6,11 @@ static int existing_helper(int x)",
+          "old_start": 6,
+          "old_count": 3,
+          "new_start": 6,
+          "new_count": 11,
+          "section": "static int existing_helper(int x)",
+          "added_lines": [
+            "static int clamp_value(int value, int limit)",
+            "{",
+            "    if (value > limit) {",
+            "        return limit;",
+            "    }",
+            "    return value;",
+            "}",
+            ""
+          ],
+          "removed_lines": [],
+          "context_lines": [
+            "}",
+            "",
+            "int compute(int value)"
+          ],
+          "diff_text": "@@ -6,3 +6,11 @@ static int existing_helper(int x)\n }\n \n+static int clamp_value(int value, int limit)\n+{\n+    if (value > limit) {\n+        return limit;\n+    }\n+    return value;\n+}\n+\n int compute(int value)",
+          "source_context": {
+            "available": true,
+            "code": "#include <stdio.h>\n\nstatic int existing_helper(int x)\n{\n    return x + 1;\n}\n\nint compute(int value)\n{\n    int result = value;\n    result = existing_helper(result);\n    log_debug(\"computed %d\", result);\n    return result;\n}",
+            "origin": "repository",
+            "file_path": "src/example.c",
+            "line_start": 1,
+            "line_end": 14,
+            "scope_function": "existing_helper",
+            "truncated": false
+          },
+          "target_context": {
+            "available": true,
+            "code": "#include <stdio.h>\n\nstatic int existing_helper(int x)\n{\n    return x + 1;\n}\n\nint compute(int value)\n{\n    int result = value;\n    result = existing_helper(result);\n    log_debug(\"computed %d\", result);\n    return result;\n}",
+            "origin": "repository",
+            "file_path": "src/example.c",
+            "line_start": 1,
+            "line_end": 14,
+            "scope_function": "existing_helper",
+            "truncated": false
+          },
+          "target_symbol_status": {
+            "clamp_value": "absent",
+            "compute": "present",
+            "value": "present",
+            "limit": "absent"
+          },
+          "retrieval_status": "complete"
+        },
+        {
+          "hunk_id": "H2",
+          "file_path": "src/example.c",
+          "target_file_path": "src/example.c",
+          "header": "@@ -10,5 +18,6 @@ int compute(int value)",
+          "old_start": 10,
+          "old_count": 5,
+          "new_start": 18,
+          "new_count": 6,
+          "section": "int compute(int value)",
+          "added_lines": [
+            "    result = clamp_value(result, 100);"
+          ],
+          "removed_lines": [],
+          "context_lines": [
+            "    int result = value;",
+            "    result = existing_helper(result);",
+            "    log_debug(\"computed %d\", result);",
+            "    return result;",
+            "}"
+          ],
+          "diff_text": "@@ -10,5 +18,6 @@ int compute(int value)\n     int result = value;\n     result = existing_helper(result);\n+    result = clamp_value(result, 100);\n     log_debug(\"computed %d\", result);\n     return result;\n }",
+          "source_context": {
+            "available": true,
+            "code": "#include <stdio.h>\n\nstatic int existing_helper(int x)\n{\n    return x + 1;\n}\n\nint compute(int value)\n{\n    int result = value;\n    result = existing_helper(result);\n    log_debug(\"computed %d\", result);\n    return result;\n}",
+            "origin": "repository",
+            "file_path": "src/example.c",
+            "line_start": 1,
+            "line_end": 14,
+            "scope_function": "compute",
+            "truncated": false
+          },
+          "target_context": {
+            "available": true,
+            "code": "#include <stdio.h>\n\nstatic int existing_helper(int x)\n{\n    return x + 1;\n}\n\nint compute(int value)\n{\n    int result = value;\n    result = existing_helper(result);\n    log_debug(\"computed %d\", result);\n    return result;\n}",
+            "origin": "repository",
+            "file_path": "src/example.c",
+            "line_start": 1,
+            "line_end": 14,
+            "scope_function": "compute",
+            "truncated": false
+          },
+          "target_symbol_status": {
+            "existing_helper": "present",
+            "clamp_value": "absent",
+            "log_debug": "partially_present",
+            "result": "present",
+            "value": "present"
+          },
+          "retrieval_status": "complete"
+        }
+      ],
+      "missing_hunks": []
+    }
+  ],
+  "traceability_template": {
+    "patch_id": "simple_dependency",
+    "agent_version": "1.0.0",
+    "analysis_version": "1.0",
+    "source_revision": "SRC",
+    "target_revision": "TGT",
+    "group_ids": [
+      "G1"
+    ],
+    "hunk_ids": [
+      "H1",
+      "H2"
+    ]
+  }
+}
