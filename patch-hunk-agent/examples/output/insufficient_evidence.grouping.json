@@ -1,0 +1,178 @@
+{
+  "patch_id": "insufficient_evidence",
+  "status": "partial",
+  "groups": [
+    {
+      "group_id": "G1",
+      "group_reason": "No strong dependency connects H1 to another hunk, so it forms its own group. D1 (DEFINITION_USE H1<->H2, CONDITIONAL) also links this hunk, but it was not promoted to a grouping edge: evidence is still pending; target_version_status=unknown does not show a missing prerequisite.",
+      "dependency_ids": [],
+      "other_dependency_ids": [],
+      "external_dependency_ids": [
+        "D1"
+      ],
+      "hunk_ids": [
+        "H1"
+      ],
+      "has_unresolved_questions": true
+    },
+    {
+      "group_id": "G2",
+      "group_reason": "No strong dependency connects H2 to another hunk, so it forms its own group. D1 (DEFINITION_USE H1<->H2, CONDITIONAL) also links this hunk, but it was not promoted to a grouping edge: evidence is still pending; target_version_status=unknown does not show a missing prerequisite.",
+      "dependency_ids": [],
+      "other_dependency_ids": [],
+      "external_dependency_ids": [
+        "D1"
+      ],
+      "hunk_ids": [
+        "H2"
+      ],
+      "has_unresolved_questions": true
+    }
+  ],
+  "cross_group_dependencies": [],
+  "unresolved_questions": [
+    {
+      "question": "Is feature_limit already available in the target version in the form this patch expects?",
+      "hunk_ids": [
+        "H1",
+        "H2"
+      ],
+      "reason": "target version state is unknown",
+      "needs_more_evidence": true,
+      "suggested_query": {
+        "symbol": "feature_limit",
+        "side": "target"
+      },
+      "affected_groups": [
+        "G1",
+        "G2"
+      ]
+    },
+    {
+      "question": "Target version state is unknown for the symbols involved in this dependency; is coordinated handling still required?",
+      "hunk_ids": [
+        "H1",
+        "H2"
+      ],
+      "reason": "target_version_status=unknown",
+      "needs_more_evidence": true,
+      "affected_groups": [
+        "G1",
+        "G2"
+      ]
+    },
+    {
+      "question": "Conditional dependency D1 between H1 and H2 was not promoted: evidence is still pending; target_version_status=unknown does not show a missing prerequisite",
+      "hunk_ids": [
+        "H1",
+        "H2"
+      ],
+      "reason": "conditional dependency left unresolved",
+      "needs_more_evidence": true,
+      "affected_groups": [
+        "G1",
+        "G2"
+      ]
+    }
+  ],
+  "validation": {
+    "all_hunks_assigned_once": true,
+    "strong_dependencies_within_groups": true,
+    "unresolved_dependencies_reported": true
+  },
+  "metadata": {
+    "analysis_version": "1.0",
+    "provider": "mock-heuristic",
+    "model": "mock-heuristic",
+    "dependency_validation": {
+      "dependency_count": 1,
+      "by_strength": {
+        "CONDITIONAL": 1
+      },
+      "by_category": {
+        "DEFINITION_USE": 1
+      },
+      "rejected_count": 0,
+      "warning_count": 0,
+      "downgrade_count": 0
+    },
+    "grouping": {
+      "hunk_count": 2,
+      "group_count": 2,
+      "group_sizes": [
+        1,
+        1
+      ],
+      "strong_edge_count": 0,
+      "promotions": [],
+      "not_promoted": [
+        {
+          "dependency_id": "D1",
+          "strength": "CONDITIONAL",
+          "pair": [
+            "H1",
+            "H2"
+          ],
+          "reasons": [
+            "evidence is still pending",
+            "target_version_status=unknown does not show a missing prerequisite"
+          ]
+        }
+      ],
+      "ignored_edges": [],
+      "graph": {
+        "node_count": 2,
+        "edge_count": 0,
+        "components": 2,
+        "edge_strengths": [
+          "STRONG"
+        ],
+        "isolated_hunks": [
+          "H1",
+          "H2"
+        ],
+        "ignored_edges": [],
+        "edges": []
+      },
+      "degree_stats": {
+        "max_degree": 0,
+        "isolated_count": 2,
+        "degrees": {
+          "H1": 0,
+          "H2": 0
+        }
+      },
+      "effective_strengths": {
+        "D1": "CONDITIONAL"
+      },
+      "weak_dependencies_not_merged": []
+    },
+    "analysis_status": "partial",
+    "usage": {
+      "prompt_tokens": 37473,
+      "completion_tokens": 999,
+      "total_tokens": 38472,
+      "calls": 6,
+      "failed_calls": 0,
+      "estimated": true
+    }
+  },
+  "errors": [],
+  "warnings": [],
+  "checks": {
+    "expected_hunk_count": 2,
+    "assigned_hunk_count": 2,
+    "group_count": 2,
+    "group_sizes": [
+      1,
+      1
+    ],
+    "strong_dependency_count": 0,
+    "unresolved_question_count": 3,
+    "affected_groups": [
+      "G1",
+      "G2"
+    ],
+    "analysis_status": "partial"
+  }
+}
