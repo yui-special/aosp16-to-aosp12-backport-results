@@ -1,0 +1,17 @@
+diff --git a/src/unknown.c b/src/unknown.c
+index 7777777..6666666 100644
+--- a/src/unknown.c
++++ b/src/unknown.c
+@@ -4,4 +4,5 @@ void configure(void)
+ void configure(void)
+ {
++    extern int feature_limit;
+     apply_policy_flags(feature_limit);
+ }
+@@ -14,5 +15,6 @@ int feature_ready(void)
+ int feature_ready(void)
+ {
+     int limit = feature_limit;
++    limit = limit < 0 ? 0 : limit;
+     return limit > 0;
+ }
