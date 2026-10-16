@@ -1,0 +1,27 @@
+# Logical providers.  Business code selects one by name, never by SDK or URL.
+providers:
+  mock:
+    kind: mock
+    model: mock-llm
+
+  mock-heuristic:
+    kind: heuristic-mock
+    model: mock-heuristic
+
+  openai:
+    kind: openai_compatible
+    base_url: "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+    api_key_env: OPENAI_API_KEY
+    model: "${OPENAI_MODEL:-gpt-4o-mini}"
+    temperature: 0.0
+    max_tokens: 4096
+    timeout_s: 90
+    max_retries: 3
+    retry_backoff_s: 1.5
+    json_response_format: true
+    # Reasoning models (e.g. deepseek-flash / R1 behind a relay) can burn the whole
+    # output budget on hidden reasoning and return empty content with
+    # finish_reason=length. "none" makes the request ask for a direct answer;
+    # PATCH_HUNK_AGENT_REASONING_EFFORT overrides this for any provider.
+    extra_body:
+      reasoning_effort: none
