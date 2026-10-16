@@ -1,0 +1,18 @@
+diff --git a/src/guard.c b/src/guard.c
+index 9999999..8888888 100644
+--- a/src/guard.c
++++ b/src/guard.c
+@@ -1,3 +1,5 @@
+ #include "guard.h"
+ 
++static int guard_limit = 0;
++
+ void guard_init(void)
+@@ -9,4 +11,6 @@ int guard_check(int value)
+ int guard_check(int value)
+ {
++    if (guard_limit <= 0) {
++        return 0;
++    }
+     return value < guard_limit;
+ }
