@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.env
+.venv/
+venv/
+results/*.json
+results/*.jsonl
+examples/output/*.json
+.portwork/
+.codexlike/
