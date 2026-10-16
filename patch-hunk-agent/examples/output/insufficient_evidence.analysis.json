@@ -1,0 +1,122 @@
+{
+  "patch_id": "insufficient_evidence",
+  "status": "partial",
+  "hunk_ids": [
+    "H1",
+    "H2"
+  ],
+  "dependencies": [
+    {
+      "dependency_id": "D1",
+      "source_hunk": "H1",
+      "target_hunk": "H2",
+      "category": "DEFINITION_USE",
+      "strength": "CONDITIONAL",
+      "evidence": [
+        {
+          "file_path": "src/unknown.c",
+          "symbol": "feature_limit",
+          "description": "H1 defines feature_limit and H2 references it (read).",
+          "line": 6
+        }
+      ],
+      "separation_risk": "The reference may remain unresolved if the definition is not ported with it.",
+      "target_version_status": "unknown",
+      "reasoning_summary": "Machine signal definition_use on symbol feature_limit; target version state reported as unknown.",
+      "needs_more_evidence": true,
+      "origin": "heuristic_mock",
+      "notes": [
+        "batch=evidence-round",
+        "attempt=1"
+      ],
+      "extra_evidence_rounds": 1
+    }
+  ],
+  "unresolved_questions": [
+    {
+      "question": "Is feature_limit already available in the target version in the form this patch expects?",
+      "hunk_ids": [
+        "H1",
+        "H2"
+      ],
+      "reason": "target version state is unknown",
+      "needs_more_evidence": true,
+      "suggested_query": {
+        "symbol": "feature_limit",
+        "side": "target"
+      }
+    },
+    {
+      "question": "Is feature_limit already available in the target version in the form this patch expects?",
+      "hunk_ids": [
+        "H1",
+        "H2"
+      ],
+      "reason": "target version state is unknown",
+      "needs_more_evidence": true,
+      "suggested_query": {
+        "symbol": "feature_limit",
+        "side": "target"
+      }
+    }
+  ],
+  "metadata": {
+    "analysis_version": "1.0",
+    "model": "mock-heuristic",
+    "provider": "mock-heuristic",
+    "candidate_pair_count": 1,
+    "analysed_pair_count": 1,
+    "skipped_pair_count": 0,
+    "batch_count": 1,
+    "duration_s": 0.0011,
+    "usage": {
+      "prompt_tokens": 37473,
+      "completion_tokens": 999,
+      "total_tokens": 38472,
+      "calls": 6,
+      "failed_calls": 0,
+      "estimated": true
+    },
+    "source_revision": null,
+    "target_revision": null
+  },
+  "rejected_records": [],
+  "call_records": [
+    {
+      "batch": "batch1",
+      "attempt": 1,
+      "status": "ok",
+      "model": "mock-heuristic",
+      "usage": {
+        "prompt_tokens": 3840,
+        "completion_tokens": 226,
+        "total_tokens": 4066,
+        "estimated": true
+      },
+      "latency_s": 0.000224,
+      "error": null,
+      "repairs": [],
+      "notes": [],
+      "dependency_count": 1,
+      "raw_text_preview": "{\"status\": \"partial\", \"dependencies\": [{\"source_hunk\": \"H1\", \"target_hunk\": \"H2\", \"category\": \"DEFINITION_USE\", \"strength\": \"CONDITIONAL\", \"evidence\": [{\"file_path\": \"src/unknown.c\", \"symbol\": \"feature_limit\", \"description\": \"H1 defines feature_limit and H2 references it (read).\", \"line\": 6}], \"separation_risk\": \"The reference may remain unresolved if the definition is not ported with it.\", \"target_version_status\": \"unknown\", \"reasoning_summary\": \"Machine signal definition_use on symbol feature_limit; target version state reported as unknown.\", \"needs_more_evidence\": true, \"origin\": \"heuristic"
+    },
+    {
+      "batch": "evidence-round",
+      "attempt": 1,
+      "status": "ok",
+      "model": "mock-heuristic",
+      "usage": {
+        "prompt_tokens": 4124,
+        "completion_tokens": 226,
+        "total_tokens": 4350,
+        "estimated": true
+      },
+      "latency_s": 0.000156,
+      "error": null,
+      "repairs": [],
+      "notes": [],
+      "dependency_count": 1,
+      "raw_text_preview": "{\"status\": \"partial\", \"dependencies\": [{\"source_hunk\": \"H1\", \"target_hunk\": \"H2\", \"category\": \"DEFINITION_USE\", \"strength\": \"CONDITIONAL\", \"evidence\": [{\"file_path\": \"src/unknown.c\", \"symbol\": \"feature_limit\", \"description\": \"H1 defines feature_limit and H2 references it (read).\", \"line\": 6}], \"separation_risk\": \"The reference may remain unresolved if the definition is not ported with it.\", \"target_version_status\": \"unknown\", \"reasoning_summary\": \"Machine signal definition_use on symbol feature_limit; target version state reported as unknown.\", \"needs_more_evidence\": true, \"origin\": \"heuristic"
+    }
+  ]
+}
