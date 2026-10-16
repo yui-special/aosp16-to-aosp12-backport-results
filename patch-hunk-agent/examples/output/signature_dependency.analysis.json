@@ -1,0 +1,76 @@
+{
+  "patch_id": "signature_dependency",
+  "status": "complete",
+  "hunk_ids": [
+    "H1",
+    "H2"
+  ],
+  "dependencies": [
+    {
+      "dependency_id": "D1",
+      "source_hunk": "H2",
+      "target_hunk": "H1",
+      "category": "INTERFACE_SIGNATURE",
+      "strength": "STRONG",
+      "evidence": [
+        {
+          "file_path": "src/caller.c",
+          "symbol": "process",
+          "description": "H2 changes the signature of process ((int x) -> (int x, int flags)) and H1 uses it.",
+          "line": 20
+        }
+      ],
+      "separation_risk": "Backporting only one side leaves the caller and the definition with mismatched parameter lists, which breaks compilation or silently changes behaviour.",
+      "target_version_status": "absent",
+      "reasoning_summary": "Machine signal signature_change on symbol process; target version state reported as absent.",
+      "needs_more_evidence": false,
+      "origin": "heuristic_mock",
+      "notes": [
+        "batch=batch1",
+        "attempt=1"
+      ]
+    }
+  ],
+  "unresolved_questions": [],
+  "metadata": {
+    "analysis_version": "1.0",
+    "model": "mock-heuristic",
+    "provider": "mock-heuristic",
+    "candidate_pair_count": 1,
+    "analysed_pair_count": 1,
+    "skipped_pair_count": 0,
+    "batch_count": 1,
+    "duration_s": 0.001147,
+    "usage": {
+      "prompt_tokens": 18263,
+      "completion_tokens": 339,
+      "total_tokens": 18602,
+      "calls": 2,
+      "failed_calls": 0,
+      "estimated": true
+    },
+    "source_revision": "SRC",
+    "target_revision": "TGT"
+  },
+  "rejected_records": [],
+  "call_records": [
+    {
+      "batch": "batch1",
+      "attempt": 1,
+      "status": "ok",
+      "model": "mock-heuristic",
+      "usage": {
+        "prompt_tokens": 9432,
+        "completion_tokens": 183,
+        "total_tokens": 9615,
+        "estimated": true
+      },
+      "latency_s": 0.000335,
+      "error": null,
+      "repairs": [],
+      "notes": [],
+      "dependency_count": 1,
+      "raw_text_preview": "{\"status\": \"complete\", \"dependencies\": [{\"source_hunk\": \"H2\", \"target_hunk\": \"H1\", \"category\": \"INTERFACE_SIGNATURE\", \"strength\": \"STRONG\", \"evidence\": [{\"file_path\": \"src/caller.c\", \"symbol\": \"process\", \"description\": \"H2 changes the signature of process ((int x) -> (int x, int flags)) and H1 uses it.\", \"line\": 20}], \"separation_risk\": \"Backporting only one side leaves the caller and the definition with mismatched parameter lists, which breaks compilation or silently changes behaviour.\", \"target_version_status\": \"absent\", \"reasoning_summary\": \"Machine signal signature_change on symbol process"
+    }
+  ]
+}
