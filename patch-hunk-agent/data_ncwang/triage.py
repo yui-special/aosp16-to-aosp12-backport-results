@@ -8,6 +8,7 @@
 用法: triage.py <patch> <summaries.json> <cve_desc> <out.json> [model]
 """
 import json
+import os
 import re
 import signal
 import ssl
@@ -20,7 +21,7 @@ import urllib.request
 sys.path.insert(0, "/data/ncwang/backport_patch/tools/patch-backporting/src")
 from tools.utils import split_patch_indexed  # noqa: E402
 
-BASE = "https://endpoint.greatrouter.com/v1"
+BASE = os.environ.get("LLM_BASE_URL", "https://endpoint.greatrouter.com/v1").rstrip("/")
 SYS = "你是 AOSP 安全补丁的回移植审阅者。只输出严格 JSON，不要 markdown、不要解释。"
 
 
@@ -122,21 +123,70 @@ DEF_RE = re.compile(
 )
 
 
+def _mapping_terms(summary):
+    """Terms that can reveal a renamed/moved equivalent in the target."""
+    contract = summary.get("semantic_contract") or {}
+    values = []
+    for key in ("search_terms", "call_chain"):
+        value = contract.get(key) or []
+        if isinstance(value, str):
+            value = [value]
+        values.extend(str(item).strip() for item in value)
+    values.extend([
+        str(summary.get("det_enclosing") or "").strip(),
+        str(summary.get("symbol_inferred") or summary.get("symbol") or "").strip(),
+    ])
+    seen, out = set(), []
+    for term in values:
+        # Keep identifiers/functions/class names and longer error strings. Short words
+        # such as "true" or "error" are not evidence of semantic equivalence.
+        if len(term) < 4 or term in seen:
+            continue
+        if not re.search(r"[A-Za-z_]", term):
+            continue
+        seen.add(term)
+        out.append(term)
+    return out[:12]
+
+
 def postprocess(rows, hunks, summaries, repo, target_ref):
-    """两条机械规则，补 LLM 判断的漏洞。"""
-    # 规则 1：hunk 所在函数在目标版本根本不存在 -> 强制 skip
+    """Mechanical safeguards around the LLM decisions."""
+    # Rule 1: a missing upstream function name is NOT enough to skip. Before skipping,
+    # search the semantic-contract terms. A hit means this hunk needs target mapping;
+    # only the absence of all strong terms permits a skip.
     for r, h, s in zip(rows, hunks, summaries):
         enc = (s.get("det_enclosing") or s.get("enclosing") or "").strip()
         if not enc or enc in ("-", "(new file)") or not repo:
             continue
-        # 全仓库搜：目标版本的路径/文件名可能和 A16 不同（搬家、改名），
-        # 限定原路径会把"文件搬家"误判成"函数不存在"
         cnt = git_count(repo, target_ref, enc)
         r["func_in_target"] = cnt
-        if cnt == 0 and r.get("port"):
+        if cnt != 0:
+            continue
+
+        term_hits = {}
+        for term in _mapping_terms(s):
+            if term == enc:
+                continue
+            term_count = git_count(repo, target_ref, term)
+            if term_count > 0:
+                term_hits[term] = term_count
+        r["semantic_candidates"] = term_hits
+        if term_hits:
+            # The name disappeared, but the behavior may have been renamed/moved or
+            # split across old target functions. Never silently turn this into skip.
+            r["port"] = True
+            r["category"] = "fix"
+            r["needs_semantic_mapping"] = True
+            r["reason"] = (r.get("reason") or "") + (
+                " | 目标无原名 %s，但语义搜索命中 %s；必须做等价映射" %
+                (enc, ", ".join(sorted(term_hits)[:6]))
+            )
+        elif r.get("port"):
             r["port"] = False
             r["category"] = "unrelated"
-            r["reason"] = (r.get("reason") or "") + " | 目标版本不存在函数 %s" % enc
+            r["reason"] = (r.get("reason") or "") + (
+                " | 目标版本不存在函数 %s，且语义搜索无候选" % enc
+            )
 
     # 规则 2/3 需要迭代到不动点：提升一个 hunk 后，它可能又拉出新的依赖
     for _round in range(5):
@@ -231,8 +281,13 @@ def main():
     summaries = json.load(open(summ_path, encoding="utf-8"))
     assert len(summaries) == len(hunks)
 
-    import os as _os
-    post_only = _os.environ.get("TRIAGE_POST_ONLY") == "1"
+    failed_summaries = [int(s.get("hunk", i)) for i, s in enumerate(summaries)
+                        if s.get("call_failed")]
+    if failed_summaries:
+        sys.exit("TRIAGE_INFRA_FAILURE: upstream summary failed for hunks %s" %
+                 failed_summaries[:20])
+
+    post_only = os.environ.get("TRIAGE_POST_ONLY") == "1"
     rows = json.load(open(out_path, encoding="utf-8")) if post_only else []
     if post_only:
         print("post-only：复用已有 LLM 判断，只跑后处理")

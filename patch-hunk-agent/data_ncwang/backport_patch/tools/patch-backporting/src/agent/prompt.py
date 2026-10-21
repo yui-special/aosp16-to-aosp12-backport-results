@@ -231,7 +231,15 @@ Rules for "does not need porting" (do not abuse this):
      function/class in the target  -> not needed;
   b) the target lacks the file but an EQUIVALENT function/class DOES exist
      -> you MUST rewrite the change against that location (see the relocation hints);
-  c) the target already contains this fix -> not needed, and point at the code.
+  c) the target already contains this fix -> not needed, and point at the code;
+  d) a hunk whose mapping status is UNRESOLVED is not evidence of absence. Search the
+     target call chain and implement the semantic contract. You may use `need not ported`
+     only after citing concrete target files/symbols that prove every obligation is
+     inapplicable; a different upstream name alone is never enough;
+  e) for ABSENT, independently verify there is no equivalent in the target; if one exists,
+     port against it;
+  f) for SPLIT mappings, use every listed target location needed to satisfy the full
+     contract, and keep the completed call chain self-consistent.
 
 Group information (provided by the grouping step):
 {group_desc}""",

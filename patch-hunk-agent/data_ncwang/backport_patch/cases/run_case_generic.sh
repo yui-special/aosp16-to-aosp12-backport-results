@@ -2,7 +2,7 @@
 # 通用 case 跑批（仓库/目标/补丁都从 config.yml 读）
 # 用法: run_case_generic.sh <dataset目录名> <CVE tag>
 #   例: run_case_generic.sh aosp-external-sqlite CVE-2025-48595
-set -u
+set -uo pipefail
 
 PROJ=${1:?usage: run_case_generic.sh <project-dir-name> <CVE>}
 CVE=${2:?usage: run_case_generic.sh <project-dir-name> <CVE>}
@@ -23,10 +23,17 @@ mkdir -p "$CASE/groups" "$CASE/inputs" "$OUT"
 echo "START $CVE $(date -Is)" > "$OUT/status.txt"
 echo "repo=$REPO target=$TARGET" >> "$OUT/status.txt"
 
+fail_stage() {
+  local stage=$1 rc=$2
+  echo "INFRA_FAILURE stage=$stage rc=$rc $(date -Is)" >> "$OUT/status.txt"
+  exit "$rc"
+}
+
 # Stage 0：端点预检。端点挂了就直接判 INFRA_FAILURE，
 # 绝不能让"调用失败"被后续阶段当成"无需移植"。
+export LLM_BASE_URL=${LLM_BASE_URL:-https://endpoint.greatrouter.com/v1}
 code=$(timeout 12 curl -s --tlsv1.2 --tls-max 1.2 -o /dev/null -w "%{http_code}" \
-  "${LLM_ENDPOINT:-https://endpoint.greatrouter.com/v1/models}" 2>/dev/null)
+  "${LLM_ENDPOINT:-$LLM_BASE_URL/models}" 2>/dev/null)
 if [ "$code" != "200" ] && [ "$code" != "401" ]; then
   echo "INFRA_FAILURE endpoint=${code:-DOWN} $(date -Is)" >> "$OUT/status.txt"
   exit 2
@@ -36,51 +43,76 @@ echo "preflight endpoint=$code" >> "$OUT/status.txt"
 export LLM_KEY=$(grep '^openai_key:' "$DS/config.yml" | sed 's/^openai_key: *//' | tr -d '"'"'"' ')
 if [ -z "${LLM_KEY:-}" ]; then echo "NO_KEY" >> "$OUT/status.txt"; exit 1; fi
 
-echo "[0/4] detect languages"
+echo "[0/6] detect languages"
 $PY "$SCRIPTS/v6_group.py" --detect-only "$DS/real.patch" > "$CASE/groups/languages.txt" 2>&1
-echo "detect rc=$? -> $(grep -c 'ctags kinds' "$CASE/groups/languages.txt") 种类型" >> "$OUT/status.txt"
+rc=$?
+echo "detect rc=$rc -> $(grep -c 'ctags kinds' "$CASE/groups/languages.txt") 种类型" >> "$OUT/status.txt"
+[ "$rc" = 0 ] || fail_stage detect "$rc"
 
-echo "[1/4] summarize"
+echo "[1/6] summarize + semantic contract"
 $PY /data/ncwang/summarize_and_group.py "$DS/real.patch" "$CASE/groups/summaries.json" \
-  > "$CASE/groups/summarize.log" 2>&1
-echo "summary rc=$?" >> "$OUT/status.txt"
+  "${SUMMARY_MODEL:-DeepSeek-V4-Pro}" > "$CASE/groups/summarize.log" 2>&1
+rc=$?
+echo "summary rc=$rc" >> "$OUT/status.txt"
+[ "$rc" = 0 ] || fail_stage summary "$rc"
 
 TRI_ARG=""
+TRI_FILE="-"
 if [ "${ENABLE_TRIAGE:-0}" = "1" ]; then
   # 先跑一次分组只为拿到精确 enclosing（不调模型），再分诊，最后带 --triage 正式分组
-  echo "[1.5/4] enclosing for triage"
+  echo "[1.5/6] enclosing for triage"
   $PY "$SCRIPTS/v6_group.py" "$REPO" "$NEW_PATCH" "$TARGET" "$DS/real.patch" \
     "$CASE/groups/summaries.json" "$CASE/groups" > "$CASE/groups/group0.log" 2>&1
-  echo "[2/4] triage"
+  rc=$?
+  echo "pre-triage group rc=$rc" >> "$OUT/status.txt"
+  [ "$rc" = 0 ] || fail_stage pre_triage_group "$rc"
+  TRI_FILE="$CASE/groups/triaged.json"
+  echo "[2/6] triage"
   $PY /data/ncwang/triage.py "$DS/real.patch" "$CASE/groups/summaries_with_enclosing.json" \
     "${CVE_DESC:-只保留该 CVE 的修复语义，版本/元数据/无关上游改动不移植}" \
-    "$CASE/groups/triaged.json" DeepSeek-V4-Pro "$REPO" "$TARGET" \
+    "$TRI_FILE" "${TRIAGE_MODEL:-DeepSeek-V4-Pro}" "$REPO" "$TARGET" \
     > "$CASE/groups/triage.log" 2>&1
   trc=$?
   echo "triage rc=$trc" >> "$OUT/status.txt"
-  if [ "$trc" != "0" ]; then
-    echo "INFRA_FAILURE triage rc=$trc $(date -Is)" >> "$OUT/status.txt"
-    exit 3
-  fi
-  TRI_ARG="--triage $CASE/groups/triaged.json"
+  [ "$trc" = 0 ] || fail_stage triage "$trc"
+  TRI_ARG="--triage $TRI_FILE"
 fi
 
-echo "[2/4] grouping"
+echo "[3/6] dependency grouping"
 $PY "$SCRIPTS/v6_group.py" $TRI_ARG "$REPO" "$NEW_PATCH" "$TARGET" "$DS/real.patch" \
   "$CASE/groups/summaries.json" "$CASE/groups" > "$CASE/groups/group.log" 2>&1
-echo "group rc=$?" >> "$OUT/status.txt"
+rc=$?
+echo "group rc=$rc" >> "$OUT/status.txt"
+[ "$rc" = 0 ] || fail_stage grouping "$rc"
 
-echo "[3/4] export"
+echo "[4/6] semantic target mapping"
+$PY "$SCRIPTS/map_semantics.py" "$REPO" "$TARGET" "$DS/real.patch" \
+  "$CASE/groups/summaries_with_enclosing.json" "$CASE/groups/groups.json" "$TRI_FILE" \
+  "$CASE/groups/semantic-mapping.json" "${MAP_MODEL:-DeepSeek-V4-Pro}" \
+  > "$CASE/groups/map-semantics.log" 2>&1
+rc=$?
+echo "semantic-mapping rc=$rc" >> "$OUT/status.txt"
+[ "$rc" = 0 ] || fail_stage semantic_mapping "$rc"
+
+echo "[5/6] export"
 rm -rf "$CASE/inputs/merged_hunks"
 $PY "$SCRIPTS/build_v6_export.py" "$DS/real.patch" "$REPO" "$TARGET" \
-  "$CASE/groups/groups.json" "$CASE/inputs" > "$CASE/inputs/export.log" 2>&1
-echo "export rc=$?" >> "$OUT/status.txt"
+  "$CASE/groups/groups.json" "$CASE/inputs" "$CASE/groups/semantic-mapping.json" \
+  > "$CASE/inputs/export.log" 2>&1
+rc=$?
+echo "export rc=$rc" >> "$OUT/status.txt"
+[ "$rc" = 0 ] || fail_stage export "$rc"
+
+if [ "${STOP_AFTER_EXPORT:-0}" = "1" ]; then
+  echo "READY_AFTER_EXPORT $(date -Is)" >> "$OUT/status.txt"
+  exit 0
+fi
 
 cp -f "$DS/config.yml" "$CFG"
 grep -v '^merged_hunks_dir' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
 echo "merged_hunks_dir: $CASE/inputs/merged_hunks/original" >> "$CFG"
 
-echo "[4/4] backport"
+echo "[6/6] backport"
 git -C "$REPO" reset --hard >/dev/null 2>&1
 cd "$SRC" || exit 1
 PATH=/data/ncwang/tools/ctags/bin:$PATH \
