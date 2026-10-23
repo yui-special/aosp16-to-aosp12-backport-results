@@ -22,7 +22,7 @@ sys.path.insert(0, "/data/ncwang/backport_patch/tools/patch-backporting/src")
 from tools.utils import split_patch_indexed  # noqa: E402
 
 BASE = os.environ.get("LLM_BASE_URL", "https://endpoint.greatrouter.com/v1").rstrip("/")
-SYS = "你是 AOSP 安全补丁的回移植审阅者。只输出严格 JSON，不要 markdown、不要解释。"
+SYS = "你是安全补丁回移植审阅者，能处理多种编程语言。只输出严格 JSON，不要 markdown、不要解释。"
 
 
 class _CallTimeout(Exception):
@@ -32,13 +32,13 @@ class _CallTimeout(Exception):
 def _alarm(signum, frame):
     raise _CallTimeout("LLM call timeout")
 
-TPL = """上游 A16 提交里混着三类内容：
+TPL = """上游提交里混着三类内容：
   ① fix       —— 目标 CVE 的修复语义，必须移植
   ② metadata  —— 版本号/元数据/升级产物（SQLITE_VERSION、METADATA、README.version、Android.patch 等），不要移植
   ③ unrelated —— 与目标 CVE 无关的其他上游改动（重构、别的 bugfix、依赖目标版本不存在的新设施），不要移植
 
 CVE 描述：{desc}
-目标版本比上游旧，上游新增的设施在目标里往往不存在。
+目标版本通常比上游旧，上游新增的设施在目标里可能不存在。
 
 hunk 所在文件：{file}
 这个 hunk 在函数里做了什么（摘要）：{summary}
@@ -127,7 +127,8 @@ def _mapping_terms(summary):
     """Terms that can reveal a renamed/moved equivalent in the target."""
     contract = summary.get("semantic_contract") or {}
     values = []
-    for key in ("search_terms", "call_chain"):
+    for key in ("search_terms", "call_chain", "callers", "callees",
+                "symbol_relations", "prerequisite_semantics"):
         value = contract.get(key) or []
         if isinstance(value, str):
             value = [value]
@@ -283,9 +284,11 @@ def main():
 
     failed_summaries = [int(s.get("hunk", i)) for i, s in enumerate(summaries)
                         if s.get("call_failed")]
-    if failed_summaries:
-        sys.exit("TRIAGE_INFRA_FAILURE: upstream summary failed for hunks %s" %
-                 failed_summaries[:20])
+    raw_limit = os.environ.get("SUMMARY_MAX_FAILURES")
+    summary_failure_limit = int(raw_limit) if raw_limit is not None else 0
+    if len(failed_summaries) > summary_failure_limit:
+        sys.exit("TRIAGE_INFRA_FAILURE: upstream summary failed for hunks %s (limit=%d)" %
+                 (failed_summaries[:20], summary_failure_limit))
 
     post_only = os.environ.get("TRIAGE_POST_ONLY") == "1"
     rows = json.load(open(out_path, encoding="utf-8")) if post_only else []

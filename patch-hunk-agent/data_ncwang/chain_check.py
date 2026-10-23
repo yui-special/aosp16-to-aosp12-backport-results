@@ -16,6 +16,10 @@ import sys
 
 SIG = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 SKIP_NAMES = {"if", "for", "while", "switch", "return", "new", "catch", "synchronized"}
+DEFAULT_GLOBS = [
+    "*.java", "*.kt", "*.aidl", "*.c", "*.cc", "*.cpp", "*.h", "*.hpp",
+    "*.rs", "*.py",
+]
 
 
 def count_args(text, start):
@@ -79,9 +83,26 @@ def signatures_from_patch(patch_text):
     return changed
 
 
+def looks_like_declaration(text, match):
+    """Filter declarations while remaining language-agnostic."""
+    before = text[:match.start()].strip()
+    if re.search(
+        r"\b(public|private|protected|static|final|abstract|synchronized|"
+        r"native|inline|extern)\b", text
+    ):
+        return True
+    if not before:
+        return False
+    if before.endswith((".", "->", "::", "=", "return", "new")):
+        return False
+    # Return type/signature prefixes such as `int`, `static void`,
+    # `SQLITE_PRIVATE int`, or `Result<T>` indicate declarations.
+    return bool(re.match(r"^[A-Za-z_~][A-Za-z0-9_:<>,*&\[\]\s]*$", before))
+
+
 def call_sites(repo, name, pathspecs):
     cmd = ["git", "-C", repo, "grep", "-n", "-F", name + "(", "--"]
-    cmd += pathspecs or ["*.java", "*.kt", "*.aidl"]
+    cmd += pathspecs or DEFAULT_GLOBS
     p = subprocess.run(cmd, capture_output=True, text=True)
     for line in p.stdout.split("\n"):
         if not line.strip():
@@ -93,19 +114,24 @@ def call_sites(repo, name, pathspecs):
         # 跳过测试代码：它们有自己的 mock/桩，签名口径不同
         if "/tests/" in f or f.endswith("Tests.java") or f.endswith("Test.java"):
             continue
-        # 跳过方法声明本身（含修饰符），只留真正的调用点
-        if re.search(r"\b(public|private|protected|static|final|abstract|synchronized|native)\b", text):
-            continue
-        m = SIG.search(text)
-        if not m or m.group(1) != name:
-            continue
-        n = count_args(text, m.end())
-        yield f, int(ln), n, text.strip()
+        pattern = re.compile(r"(?<![A-Za-z0-9_])%s\s*\(" % re.escape(name))
+        for m in pattern.finditer(text):
+            if looks_like_declaration(text, m):
+                continue
+            n = count_args(text, m.end())
+            yield f, int(ln), n, text.strip()
+            break
 
 
 def main():
     repo, patch_file = sys.argv[1], sys.argv[2]
     pathspecs = sys.argv[3:]
+    if not pathspecs:
+        pathspecs = [
+            item.strip() for item in os.environ.get(
+                "CHAIN_CHECK_GLOBS", ",".join(DEFAULT_GLOBS)
+            ).split(",") if item.strip()
+        ]
     changed = signatures_from_patch(open(patch_file, encoding="utf-8", errors="replace").read())
     bad = []
     for name, info in sorted(changed.items()):

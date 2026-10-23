@@ -17,7 +17,8 @@ from tools.utils import split_patch_indexed  # noqa: E402
 
 BASE = os.environ.get("LLM_BASE_URL", "https://endpoint.greatrouter.com/v1").rstrip("/")
 SYS = (
-    "你是 AOSP 代码审阅者。只输出严格 JSON，不要 markdown、不要解释。"
+    "你是代码补丁审阅者，能分析 Java/Kotlin/C/C++/Python/Rust 等多种语言。"
+    "只输出严格 JSON，不要 markdown、不要解释。"
 )
 TPL = """下面是一个上游补丁里的**单个 hunk**（文件：{file}）。
 
@@ -36,6 +37,7 @@ param_change：该 hunk 是否改变了这个方法的参数（"add" / "remove" 
 semantic_contract 必须描述修复语义，而不是只复述代码。字段：
   goal               —— 这个改动要保证/阻止什么行为
   behavior           —— 目标版本必须保持的行为
+  enclosing_role     —— 当前 hunk 所在函数/方法/符号/内层作用域的职责，以及它在修复中承担哪一步
   inputs             —— 关键输入、参数或状态
   preconditions      —— 生效前提
   state_read          —— 读取的状态/调用
@@ -43,6 +45,10 @@ semantic_contract 必须描述修复语义，而不是只复述代码。字段�
   side_effects        —— 返回值、异常、权限、日志等外部效果
   failure_behavior    —— 失败/拒绝路径
   call_chain          —— 涉及的上游调用链，按调用顺序
+  callers             —— hunk/上下文中能确定的调用方；不确定时留空，不要猜
+  callees             —— 本改动直接调用或依赖的函数/构造器
+  symbol_relations    —— 逐条写出“调用者 -> 被调用者: 数据流/条件/返回值/副作用关系”
+  prerequisite_semantics —— 这个修复默认目标已经存在的旧机制、字段、入口或调用链；没有则留空
   search_terms        —— 在目标仓库中搜索等价实现时使用的 3~12 个精确标识符、方法名、类名、字符串或注释短语
   obligations         —— 移植后必须逐项满足的 1~6 条语义义务
 
@@ -51,9 +57,10 @@ semantic_contract 必须描述修复语义，而不是只复述代码。字段�
 
 只输出严格 JSON：
 {{"kind": "...", "symbol": "...", "param_change": "...", "summary": "一句中文",
-  "semantic_contract": {{"goal": "...", "behavior": "...", "inputs": [], "preconditions": [],
+  "semantic_contract": {{"goal": "...", "behavior": "...", "enclosing_role": "...", "inputs": [], "preconditions": [],
   "state_read": [], "state_written": [], "side_effects": [], "failure_behavior": "...",
-  "call_chain": [], "search_terms": [], "obligations": []}}}}
+  "call_chain": [], "callers": [], "callees": [], "symbol_relations": [],
+  "prerequisite_semantics": [], "search_terms": [], "obligations": []}}}}
 
 hunk：
 {hunk}
@@ -109,9 +116,11 @@ def parse_json(text):
 
 
 CONTRACT_FIELDS = (
-    "goal", "behavior", "inputs", "preconditions", "state_read", "state_written",
-    "side_effects", "failure_behavior", "call_chain", "search_terms", "obligations",
+    "goal", "behavior", "enclosing_role", "inputs", "preconditions", "state_read",
+    "state_written", "side_effects", "failure_behavior", "call_chain", "callers",
+    "callees", "symbol_relations", "prerequisite_semantics", "search_terms", "obligations",
 )
+STRING_CONTRACT_FIELDS = {"goal", "behavior", "failure_behavior", "enclosing_role"}
 
 
 def normalize_contract(obj):
@@ -121,8 +130,8 @@ def normalize_contract(obj):
         raw = {}
     out = {}
     for key in CONTRACT_FIELDS:
-        value = raw.get(key, [] if key not in ("goal", "behavior", "failure_behavior") else "")
-        if key in ("goal", "behavior", "failure_behavior"):
+        value = raw.get(key, "" if key in STRING_CONTRACT_FIELDS else [])
+        if key in STRING_CONTRACT_FIELDS:
             out[key] = str(value or "").strip()
         else:
             if isinstance(value, str):
@@ -139,6 +148,24 @@ def normalize_contract(obj):
     return out
 
 
+def call_json(key, model, prompt):
+    """Ask for one JSON object and repair malformed output in-place."""
+    raw = call(key, model, prompt)
+    try:
+        return parse_json(raw)
+    except Exception as first_error:  # noqa: BLE001
+        repair = (
+            "上一条回答不是合法 JSON。请根据原任务修复格式，只输出一个完整 JSON 对象。\n"
+            "解析错误：%s\n\n原任务：\n%s\n\n上一条回答：\n%s" %
+            (first_error, prompt, raw[:24000])
+        )
+        repaired = call(key, model, repair)
+        try:
+            return parse_json(repaired)
+        except Exception as second_error:  # noqa: BLE001
+            raise ValueError("JSON parse failed after repair: %s" % second_error)
+
+
 def main():
     patch, out = sys.argv[1], sys.argv[2]
     model = sys.argv[3] if len(sys.argv) > 3 else "DeepSeek-V4-Pro"
@@ -151,13 +178,23 @@ def main():
     print("hunk 数:", len(hunks))
 
     rows = []
+    hunk_retries = int(os.environ.get("SUMMARY_HUNK_RETRIES", "2"))
     for h in hunks:
         prompt = TPL.format(file=h["file"], hunk=h["text"])
-        try:
-            obj = parse_json(call(key, model, prompt))
-        except Exception as e:  # noqa: BLE001
+        obj = None
+        last_error = None
+        for attempt in range(hunk_retries + 1):
+            try:
+                obj = call_json(key, model, prompt)
+                break
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                if attempt < hunk_retries:
+                    time.sleep(2)
+        if obj is None:
             obj = {"kind": "unknown", "symbol": "", "param_change": "",
-                   "summary": "CALL_FAILED: %s" % e, "call_failed": True}
+                   "summary": "CALL_FAILED: %s" % last_error, "call_failed": True,
+                   "summary_attempts": hunk_retries + 1}
         obj["semantic_contract"] = normalize_contract(obj)
         obj["hunk"] = h["idx"]
         obj["file"] = h["file"]
@@ -173,7 +210,7 @@ def main():
     # skip. The runner treats a non-zero exit as an infrastructure failure.
     failures = sum(1 for row in rows if row.get("call_failed"))
     raw_limit = os.environ.get("SUMMARY_MAX_FAILURES")
-    limit = int(raw_limit) if raw_limit is not None else max(2, len(rows) // 10)
+    limit = int(raw_limit) if raw_limit is not None else 0
     if failures > limit:
         sys.exit("SUMMARY_INFRA_FAILURE: %d/%d hunk summaries failed (limit=%d)" % (
             failures, len(rows), limit))

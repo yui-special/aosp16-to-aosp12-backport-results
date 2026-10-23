@@ -540,6 +540,8 @@ def dump_merged_hunks(merged, out_dir: str):
                 "why": g.get("why", ""),
                 "files": g["files"],
                 "hints": g.get("hints", ""),
+                "mapping_status": g.get("mapping_status", []),
+                "strict_requires_patch": bool(g.get("strict_requires_patch", False)),
             }
         )
         head.append(
@@ -626,6 +628,8 @@ def load_merged_hunk_files(dir_path: str, index_name: str = "index.json"):
                 "why": m.get("why", ""),
                 "files": m.get("files", patch_files),
                 "hints": m.get("hints", ""),
+                "mapping_status": m.get("mapping_status", []),
+                "strict_requires_patch": bool(m.get("strict_requires_patch", False)),
                 "text": text,
                 "source_file": os.path.join(dir_path, fn),
             }
@@ -699,7 +703,8 @@ def hunk_added_identifiers(hunk_text: str):
     return (added - removed) - _IDENT_STOPWORDS
 
 
-def hunk_coverage_report(member_hunks, produced_patch_text: str, need_not_ported: bool = False):
+def hunk_coverage_report(member_hunks, produced_patch_text: str, need_not_ported: bool = False,
+                         strict_requires_patch: bool = False, directly_applied: bool = False):
     """
     检查「这一组的产出」是否覆盖了组内每个成员 hunk。
 
@@ -713,6 +718,7 @@ def hunk_coverage_report(member_hunks, produced_patch_text: str, need_not_ported
          "missing": [idx...], "need_not_ported": bool}
 
     判定规则（宁可漏报也不误报）：
+      - strict_requires_patch + 空产出  -> 全部未覆盖（不允许静默 need_not_ported）；
       - need_not_ported=True            -> 全部视为覆盖（模型显式声明了）；
       - 该 hunk 没新增任何标识符          -> 视为覆盖（纯格式/注释类改动，无法判定）；
       - 该 hunk 新增的标识符有出现在产出里 -> 覆盖；
@@ -758,7 +764,11 @@ def hunk_coverage_report(member_hunks, produced_patch_text: str, need_not_ported
     for h in member_hunks:
         distinctive = added_sets[h["idx"]] - shared
         hit = sorted(distinctive & produced)
-        if need_not_ported:
+        if directly_applied:
+            covered, reason = True, "directly_applied"
+        elif strict_requires_patch and not produced_patch_text.strip():
+            covered, reason = False, "strict_mapping_requires_patch"
+        elif need_not_ported:
             covered, reason = True, "need_not_ported"
         elif not distinctive:
             covered, reason = True, "no_distinctive_identifier"
@@ -783,6 +793,8 @@ def hunk_coverage_report(member_hunks, produced_patch_text: str, need_not_ported
         "members": members,
         "missing": missing,
         "need_not_ported": need_not_ported,
+        "strict_requires_patch": strict_requires_patch,
+        "directly_applied": directly_applied,
     }
 
 

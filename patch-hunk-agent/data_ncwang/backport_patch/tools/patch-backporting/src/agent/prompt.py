@@ -206,6 +206,10 @@ backported TOGETHER, as ONE unit: some hunks of the group introduce or update a 
 an interface method or a parameter, and the other hunks of the group use it.
 If you port only a part of the group, the result will not compile or will be
 semantically wrong. The patch you finally validate MUST contain every hunk of the group.
+
+Before editing, identify for every hunk: the enclosing function's responsibility, its
+callers and callees, and the data/control/return/side-effect relationship between them.
+A target path match without the same reachable call chain is NOT semantic equivalence.
 """
 )
 
@@ -227,18 +231,23 @@ decide EACH hunk separately:
     either port the whole chain, or declare the whole chain not-needed with reasons.
 
 Rules for "does not need porting" (do not abuse this):
-  a) the target really lacks the file/class AND you cannot find an equivalent
-     function/class in the target  -> not needed;
-  b) the target lacks the file but an EQUIVALENT function/class DOES exist
-     -> you MUST rewrite the change against that location (see the relocation hints);
-  c) the target already contains this fix -> not needed, and point at the code;
-  d) a hunk whose mapping status is UNRESOLVED is not evidence of absence. Search the
+  a) a missing file/class/function is NEVER enough by itself. Trace the enclosing function's
+     role plus its callers and callees. If the target lacks prerequisite fields, entry points,
+     or an entire upstream feature, port the required prerequisite chain instead of skipping;
+  b) if an equivalent function/class exists, rewrite the change against it, preserving the
+     caller -> callee relationship and all semantic obligations;
+  c) `need not ported` requires a complete target call-path proof: show that no reachable path
+     can exercise the vulnerable behavior and explain why every contract obligation is absent.
+     "The upstream symbol/new code does not exist" is NOT such proof;
+  d) UNRESOLVED and REQUIRES_PREREQUISITE mappings require a real patch or an explicit group
+     failure. They can never be silently converted to an empty success;
+  e) a hunk whose mapping status is UNRESOLVED is not evidence of absence. Search the
      target call chain and implement the semantic contract. You may use `need not ported`
      only after citing concrete target files/symbols that prove every obligation is
      inapplicable; a different upstream name alone is never enough;
-  e) for ABSENT, independently verify there is no equivalent in the target; if one exists,
+  f) for ABSENT, independently verify there is no equivalent in the target; if one exists,
      port against it;
-  f) for SPLIT mappings, use every listed target location needed to satisfy the full
+  g) for SPLIT mappings, use every listed target location needed to satisfy the full
      contract, and keep the completed call chain self-consistent.
 
 Group information (provided by the grouping step):

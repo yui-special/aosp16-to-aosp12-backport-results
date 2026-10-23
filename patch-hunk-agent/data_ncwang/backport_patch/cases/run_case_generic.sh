@@ -14,6 +14,7 @@ CASE=$ROOT/cases/$CVE
 SCRIPTS=$ROOT/cases/CVE-2025-48649/scripts
 CFG=$CASE/config.yml
 OUT=${OUT:-$CASE/runs/official}
+export CHAIN_CHECK_SCRIPT=${CHAIN_CHECK_SCRIPT:-$(dirname "$ROOT")/chain_check.py}
 
 REPO=$(grep '^project_dir:' "$DS/config.yml" | awk '{print $2}')
 TARGET=$(grep '^target_release:' "$DS/config.yml" | awk '{print $2}')
@@ -122,7 +123,7 @@ rc=$?
 echo "EXIT $rc $(date -Is)" >> "$OUT/status.txt"
 
 cp -f "$DS/complete.patch" "$OUT/complete.patch" 2>/dev/null
-cp -f "$CASE/inputs/merged_hunks/ported"/* "$OUT/" 2>/dev/null
+cp -a "$CASE/inputs/merged_hunks/ported/." "$OUT/" 2>/dev/null || true
 cp -f "$CFG" "$OUT/config.used.yml" 2>/dev/null
 
 # API 链完整性检查（改签名后是否还有调用点用旧参数个数）

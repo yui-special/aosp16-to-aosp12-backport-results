@@ -54,6 +54,11 @@ environments, backups and secrets are intentionally excluded.
 8. `chain_check.py` checks changed call signatures and `make_verdict.py`
    produces the final case verdict.
 
+The grouping stage caps each connected component at `MAX_GROUP_HUNKS` (default
+8) so a large transitive component cannot dilute one model session. Summary
+relations are indexed from `symbol`, discovered declarations and
+`enclosing_role`, while relationship text supplies the reverse lookup.
+
 ## Status of the three requested mechanisms
 
 1. **Per-hunk LLM summary and semantic contract: implemented.** The summary
@@ -74,6 +79,12 @@ environments, backups and secrets are intentionally excluded.
    Failed summaries, triage calls and mapping calls terminate the runner with a
    non-zero status. `UNRESOLVED` is explicitly forbidden from being treated as
    "need not ported" without concrete target-code evidence.
+6. **Final-patch global validation: implemented.** After all group sessions,
+   every selected non-skipped hunk is checked again against the final composed
+   patch. The cumulative target tree then runs `chain_check.py`; the results are
+   written to `global-validation.json` and per-group status files receive
+   `global_covered`, `global_api_chain_ok` and `global_validation_complete`.
+   A case cannot be `OK` if this global gate fails.
 
 ## Configuration
 
@@ -93,6 +104,11 @@ Relevant optional environment variables:
   runs require an online semantic mapping and abort on API failure.
 - `STOP_AFTER_EXPORT=1`: stop after the PortGPT input has been generated; used
   for pipeline smoke tests.
+- `MAX_GROUP_HUNKS`: maximum hunks per PortGPT session (default 8).
+- `CHAIN_CHECK_SCRIPT`: path to the API-chain checker; the generic runner
+  derives it relative to its project root.
+- `CHAIN_CHECK_GLOBS`: comma-separated source patterns used by the chain check
+  (defaults include Java, Kotlin, AIDL, C, C++, headers, Rust and Python).
 
 ## Deployment note
 

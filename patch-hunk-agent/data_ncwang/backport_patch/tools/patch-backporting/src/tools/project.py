@@ -1,7 +1,10 @@
 import os
 import re
+import json
+import hashlib
 import subprocess
 import tempfile
+import time
 from types import SimpleNamespace
 from typing import List, Tuple
 
@@ -34,6 +37,10 @@ class Project:
         self.compile_succeeded = False
         self.testcase_succeeded = False
         self.poc_succeeded = False
+        self.checkpoint_dir = None
+        self.validated_patch_checkpoints = []
+        self.full_patch_base = None
+        self.validated_complete_patch = None
         self.symbol_map = {}
         self.now_hunk = ""
         self.now_hunk_num = 0
@@ -42,6 +49,53 @@ class Project:
         self.last_context = []
         # [P0] 文件"搬移推断"的递归深度（只允许一层，避免 5^k 重试爆炸）
         self._move_depth = 0
+
+    def persist_validated_patch(self, patch: str, ref: str):
+        """Persist a successfully validated candidate immediately.
+
+        The candidate may be a full patch or a revision fragment. It is kept as
+        a checkpoint so a later gateway disconnect cannot erase work already
+        accepted by `validate`.
+        """
+        if not self.checkpoint_dir or not patch or "need not ported" in patch:
+            return None
+        if "diff --git" not in patch and "--- a/" not in patch:
+            return None
+
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        canonical = patch
+        if self.full_patch_base:
+            try:
+                full = self.repo.git.diff(self.full_patch_base)
+                if full and full.strip():
+                    canonical = full
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Could not derive canonical full patch: %s" % e)
+        self.validated_complete_patch = canonical
+        digest = hashlib.sha256(
+            canonical.encode("utf-8", "surrogateescape")
+        ).hexdigest()[:16]
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        checkpoint = os.path.join(
+            self.checkpoint_dir, "validated-%s-%s.patch" % (stamp, digest)
+        )
+        blob = canonical if canonical.endswith("\n") else canonical + "\n"
+        for path in (checkpoint, os.path.join(self.checkpoint_dir, "latest-validated.patch")):
+            tmp = path + ".tmp.%d" % os.getpid()
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(blob)
+            os.replace(tmp, path)
+        self.validated_patch_checkpoints.append(checkpoint)
+        try:
+            with open(os.path.join(self.checkpoint_dir, "latest-validated.json"),
+                      "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"ref": ref, "patch": checkpoint, "sha256": digest,
+                           "canonical_full_patch": canonical != patch},
+                          fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+        logger.info("Validated patch checkpoint saved: %s" % checkpoint)
+        return checkpoint
 
     def _checkout(self, ref: str) -> None:
         self.repo.git.reset("--hard")
@@ -871,7 +925,10 @@ def create_validate_tool(project: Project):
         """
         validate a patch on a specific ref of the target repository.
         """
-        return project._validate(ref, patch)
+        ret = project._validate(ref, patch)
+        if project.poc_succeeded:
+            project.persist_validated_patch(patch, ref)
+        return ret
 
     return validate
 

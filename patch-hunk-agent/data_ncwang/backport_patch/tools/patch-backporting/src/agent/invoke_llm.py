@@ -4,6 +4,7 @@ import re
 import shutil
 import ssl
 import subprocess
+import sys
 import tempfile
 import httpx
 
@@ -207,7 +208,23 @@ def rebuild_from_candidate(project, base, branch, candidate):
         if not _try_apply(project, candidate, recount=True):
             repo.git.reset("--hard")
             repo.git.checkout(branch)
-            return None
+            # A final-repair session often validates a small revision fragment
+            # against the already-ported cumulative branch. That fragment cannot
+            # apply to the clean base, but applying it to the branch and diffing
+            # against base reconstructs the complete validated artifact.
+            if not _try_apply(project, candidate, check_only=True):
+                if not _try_apply(project, candidate, recount=True):
+                    repo.git.reset("--hard")
+                    repo.git.checkout(branch)
+                    return None
+            if not _try_apply(project, candidate):
+                repo.git.reset("--hard")
+                repo.git.checkout(branch)
+                return None
+            fixed = repo.git.diff(base)
+            repo.git.reset("--hard")
+            repo.git.checkout(branch)
+            return fixed if fixed.strip() else None
     else:
         _try_apply(project, candidate)
 
@@ -215,6 +232,94 @@ def rebuild_from_candidate(project, base, branch, candidate):
     repo.git.reset("--hard")
     repo.git.checkout(branch)
     return fixed if fixed.strip() else None
+
+
+def write_patch_atomic(path, text):
+    tmp = path + ".tmp.%d" % os.getpid()
+    blob = text if text.endswith("\n") else text + "\n"
+    with open(tmp, "wb") as fh:
+        fh.write(blob.encode("utf-8", "surrogateescape"))
+    os.replace(tmp, path)
+
+
+def evaluate_global_artifact(
+    project, complete_patch, complete_path, ported_dir, hunks_by_idx,
+    selected_hunks, accepted_need_not_ported, any_strict_requires_patch, cumulative,
+):
+    """Re-evaluate the final patch and refresh all global status artifacts."""
+    global_member_idxs = sorted(selected_hunks - accepted_need_not_ported)
+    global_members = [hunks_by_idx[i] for i in global_member_idxs if i in hunks_by_idx]
+    global_cov = hunk_coverage_report(
+        global_members,
+        complete_patch,
+        need_not_ported=False,
+        strict_requires_patch=any_strict_requires_patch,
+        directly_applied=False,
+    )
+
+    chain_script = os.environ.get("CHAIN_CHECK_SCRIPT", "/data/ncwang/chain_check.py")
+    chain_path = os.path.join(ported_dir, "global-api-chain.txt")
+    if cumulative:
+        chain_proc = subprocess.run(
+            [sys.executable, chain_script, project.dir, complete_path],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        chain_rc = chain_proc.returncode
+        chain_report = (chain_proc.stdout or "") + (chain_proc.stderr or "")
+    else:
+        chain_rc = 1
+        chain_report = "API chain check requires cumulative mode.\n"
+    with open(chain_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(chain_report)
+
+    global_complete = (
+        bool(complete_patch.strip()) and global_cov["complete"] and chain_rc == 0
+    )
+    coverage_by_idx = {
+        int(m["idx"]): bool(m["covered"]) for m in global_cov["members"]
+    }
+    for fn in os.listdir(ported_dir):
+        if not (fn.startswith("merged-hunk-") and fn.endswith(".status.json")):
+            continue
+        status_file = os.path.join(ported_dir, fn)
+        try:
+            with open(status_file, encoding="utf-8") as fh:
+                status_data = json.load(fh)
+        except Exception:  # noqa: BLE001
+            continue
+        members = [int(i) for i in status_data.get("member_hunks", [])]
+        status_data["global_covered"] = all(
+            i in accepted_need_not_ported or coverage_by_idx.get(i, False)
+            for i in members
+        )
+        status_data["global_api_chain_ok"] = chain_rc == 0
+        status_data["global_validation_complete"] = global_complete
+        with open(status_file, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(status_data, fh, ensure_ascii=False, indent=2)
+
+    global_result = {
+        "complete": global_complete,
+        "patch_bytes": len(complete_patch.encode("utf-8", "surrogateescape"))
+        if complete_patch else 0,
+        "selected_hunks": sorted(selected_hunks),
+        "accepted_need_not_ported_hunks": sorted(accepted_need_not_ported),
+        "coverage_hunks": global_member_idxs,
+        "coverage": global_cov,
+        "api_chain_rc": chain_rc,
+        "api_chain_report": chain_report,
+    }
+    with open(
+        os.path.join(ported_dir, "global-validation.json"),
+        "w", encoding="utf-8", newline="\n",
+    ) as fh:
+        json.dump(global_result, fh, ensure_ascii=False, indent=2)
+    if global_cov["missing"]:
+        logger.error("Global coverage missing hunks: %s" % global_cov["missing"])
+    if chain_rc != 0:
+        logger.error("Global API chain validation failed; see %s" % chain_path)
+    return global_complete, global_result
 
 
 def commit_group(project, patches, gpos, group):
@@ -280,6 +385,14 @@ def describe_group(group):
     lines.append(
         "Original hunk ids in the upstream patch: %s" % ", ".join(str(i) for i in group["hunks"])
     )
+    if group.get("strict_requires_patch"):
+        lines.append(
+            "Empty success is forbidden for this group: unresolved or prerequisite-dependent "
+            "semantics require a concrete patch. Prove a completely unreachable vulnerability "
+            "call path or fail the group."
+        )
+    if group.get("mapping_status"):
+        lines.append("Semantic mapping status: %s" % ", ".join(group["mapping_status"]))
     if group.get("hints"):
         lines.append("")
         lines.append(group["hints"])
@@ -310,6 +423,7 @@ def do_backport(
     patch = project._get_patch(data.new_patch)
     cumulative = bool(getattr(data, "cumulative", False))
     cum_base = getattr(data, "cum_base", "") or ""
+    project.full_patch_base = cum_base or None
 
     # 输入有两种来源（优先用「已经合并好的文件」）：
     #   1) merged_hunks 目录里的 *.patch —— 每个文件就是一组已经合并好的 hunk，
@@ -358,6 +472,9 @@ def do_backport(
             merged_hunks, os.path.join(data.patch_dataset_dir, "merged_hunks")
         )
 
+    project.checkpoint_dir = os.path.join(ported_dir, "validated-checkpoints")
+    os.makedirs(project.checkpoint_dir, exist_ok=True)
+
     if not merged_hunks:
         logger.error(
             "没有拿到任何 merged hunk（分组文件为空 / merged_hunks 目录里没有 *.patch），退出"
@@ -386,6 +503,10 @@ def do_backport(
     ledger = []
     ledger_limit = int(getattr(data, "ledger_chars", 6000) or 6000)
 
+    all_groups_complete = True
+    selected_hunks = set()
+    accepted_need_not_ported = set()
+    any_strict_requires_patch = False
     for gpos, group in selected:
         pp = group["text"]
         members = group["hunks"] or ["?"]
@@ -399,6 +520,10 @@ def do_backport(
         project.round_succeeded = False
         project.context_mismatch_times = 0
         n_before = len(project.succeeded_patches)
+        directly_applied = False
+        strict_requires_patch = bool(group.get("strict_requires_patch", False))
+        any_strict_requires_patch = any_strict_requires_patch or strict_requires_patch
+        selected_hunks.update(int(i) for i in group.get("hunks", []))
 
         def produced_patches():
             return list(project.succeeded_patches[n_before:])
@@ -419,9 +544,12 @@ def do_backport(
         def check_coverage():
             """本组产出是否覆盖了组内每个成员 hunk（不依赖 LLM）。"""
             produced = produced_patches()
-            need_not_ported = project.round_succeeded and not produced
+            need_not_ported = (project.round_succeeded and not produced
+                               and not strict_requires_patch and not directly_applied)
             return hunk_coverage_report(
-                member_hunks, "\n".join(produced), need_not_ported
+                member_hunks, "\n".join(produced), need_not_ported,
+                strict_requires_patch=strict_requires_patch,
+                directly_applied=directly_applied,
             )
 
         def save_status(cov, attempts):
@@ -435,6 +563,8 @@ def do_backport(
                         "complete": cov["complete"],
                         "missing_hunks": cov["missing"],
                         "need_not_ported": cov["need_not_ported"],
+                        "strict_requires_patch": strict_requires_patch,
+                        "mapping_status": group.get("mapping_status", []),
                         "coverage_attempts": attempts,
                         "members": cov["members"],
                     },
@@ -474,6 +604,7 @@ def do_backport(
             ret = "TARGET_FILE_MISSING: %s could not be applied (%s)" % (group_tag, e)
             project.round_succeeded = False
         if project.round_succeeded:
+            directly_applied = True
             logger.debug(f"{group_tag} can be applied without any conflicts")
         else:
             block_list = re.findall(r"older version.\n(.*?)\nBesides,", ret, re.DOTALL)
@@ -512,6 +643,7 @@ def do_backport(
                 save_ported()
                 # [P0] 一组失败不再终止整个运行：记录状态后继续下一组
                 save_status(check_coverage(), 0)
+                all_groups_complete = False
                 ledger.extend(produced_patches())
                 if cumulative:
                     commit_group(project, produced_patches(), gpos, group)
@@ -565,8 +697,14 @@ def do_backport(
                 break
             cov = check_coverage()
 
+        if not cov["complete"] and strict_requires_patch and not produced_patches():
+            project.round_succeeded = False
         save_ported()
         save_status(cov, attempts)
+        if cov.get("need_not_ported"):
+            accepted_need_not_ported.update(int(i) for i in group.get("hunks", []))
+        if not cov["complete"]:
+            all_groups_complete = False
         # 本组产出记入账本，供后面的组参考
         ledger.extend(produced_patches())
         if cumulative:
@@ -586,7 +724,7 @@ def do_backport(
             )
             logger.error("    详情见 %s" % status_path)
 
-    project.all_hunks_applied_succeeded = True
+    project.all_hunks_applied_succeeded = all_groups_complete
     logger.info(f"Aplly all hunks in the patch      PASS")
     project.now_hunk = "completed"
     if cumulative and cum_base:
@@ -597,6 +735,13 @@ def do_backport(
         complete_patch = project.repo.git.diff("%s..%s" % (cum_base, data.target_release))
     else:
         complete_patch = "\n".join(project.succeeded_patches)
+
+    # An all-need-not-ported result has no auditable patch. Treat it as evidence
+    # required, not as a successful backport; this also prevents the final
+    # validation path from reporting success for an empty patch.
+    if not complete_patch.strip():
+        all_groups_complete = False
+        project.round_succeeded = False
 
     # 把「完整 patch」落盘 —— 这是本次移植的最终产物（等价于 PortGPT 平时打印出来的那一份）。
     # 单组模式（--only-group N）不覆盖全量产物，另存为 complete-group-NN.patch。
@@ -617,6 +762,25 @@ def do_backport(
     except OSError as e:  # noqa: BLE001
         logger.warning("写完整 patch 失败: %s" % e)
 
+    # ---- Global validation over the FINAL composed patch --------------------
+    # This runs once before final repair and again after the validated artifact
+    # is rebuilt, so stale pre-repair statuses cannot report a false success.
+    all_groups_complete, global_result = evaluate_global_artifact(
+        project, complete_patch, complete_path, ported_dir, hunks_by_idx,
+        selected_hunks, accepted_need_not_ported, any_strict_requires_patch,
+        cumulative,
+    )
+
+    if not all_groups_complete:
+        if not cumulative:
+            project.repo.git.clean("-fdx")
+        logger.error(
+            "Backport INCOMPLETE: at least one group lacks a required patch or complete "
+            "global coverage or API-chain closure. The partial complete.patch was preserved "
+            "for inspection."
+        )
+        return
+
     if not cumulative:
         project.repo.git.clean("-fdx")
     for file in os.listdir(data.patch_dataset_dir):
@@ -631,6 +795,10 @@ def do_backport(
     # 累积模式下 target_release 指向累积分支（改动已经在那里），校验要用干净的 base
     validate_ret = project._validate(cum_base or data.target_release, complete_patch)
     if project.poc_succeeded:
+        project.persist_validated_patch(complete_patch, cum_base or data.target_release)
+        write_patch_atomic(complete_path, complete_patch)
+        final_checkpoint = os.path.join(project.checkpoint_dir, "final-complete.patch")
+        write_patch_atomic(final_checkpoint, complete_patch)
         logger.info(
             f"Successfully backport the patch to the target release {data.target_release}"
         )
@@ -652,38 +820,120 @@ def do_backport(
     agent_executor = AgentExecutor(
         agent=agent, tools=tools, verbose=True, max_iterations=20
     )
-    n_before_repair = len(project.succeeded_patches)
-    agent_executor.invoke(
-        {
-            "project_url": data.project_url,
-            "new_patch_parent": data.new_patch_parent,
-            "target_release": data.target_release,
-            "new_patch": patch,
-            "complete_patch": complete_patch,
-            "compile_ret": validate_ret,
-        },
-        {"callbacks": [log_handler]},
-    )
+    try:
+        agent_executor.invoke(
+            {
+                "project_url": data.project_url,
+                "new_patch_parent": data.new_patch_parent,
+                "target_release": data.target_release,
+                "new_patch": patch,
+                "complete_patch": complete_patch,
+                "compile_ret": validate_ret,
+            },
+            {"callbacks": [log_handler]},
+        )
+    except Exception as e:  # noqa: BLE001
+        if project.poc_succeeded:
+            logger.warning(
+                "Final repair session ended with %s after a validated patch was saved; "
+                "using the validated checkpoint." % type(e).__name__
+            )
+        else:
+            logger.error("Final repair session failed: %s: %s" % (type(e).__name__, e))
+            project.round_succeeded = False
     if project.poc_succeeded:
         logger.info(
             f"Successfully backport the patch to the target release {data.target_release}"
         )
-        # 只有修复循环**真的改过补丁**（succeeded_patches 有新增）才重建产物；
-        # 否则保持已落盘的分支 diff 不变，保证未修复的运行结果完全一致。
-        if len(project.succeeded_patches) > n_before_repair and cumulative and cum_base:
-            repaired = project.succeeded_patches[-1]
-            fixed = rebuild_from_candidate(project, cum_base, data.target_release, repaired)
-            if fixed:
+        # Every successful final validation immediately creates a checkpoint.
+        # Rebuild the complete artifact from a full patch when possible, or from
+        # the validated fragment on top of the cumulative branch. The old
+        # artifact is never silently preserved when this reconstruction fails.
+        candidates = []
+        if project.succeeded_patches:
+            candidates.append(project.succeeded_patches[-1])
+        latest_checkpoint = os.path.join(
+            project.checkpoint_dir, "latest-validated.patch"
+        )
+        if os.path.isfile(latest_checkpoint):
+            checkpoint_text = open(latest_checkpoint, encoding="utf-8").read()
+            if checkpoint_text and checkpoint_text not in candidates:
+                candidates.append(checkpoint_text)
+
+        fixed = None
+        if cumulative and cum_base:
+            for candidate in reversed(candidates):
+                fixed = rebuild_from_candidate(
+                    project, cum_base, data.target_release, candidate
+                )
+                if fixed:
+                    break
+        elif candidates:
+            fixed = candidates[-1]
+
+        if not fixed or not fixed.strip():
+            project.poc_succeeded = False
+            project.round_succeeded = False
+            if os.path.exists(complete_path):
+                stale_path = complete_path + ".stale"
                 try:
-                    with open(complete_path, "wb") as fh:
-                        blob = fixed if fixed.endswith("\n") else fixed + "\n"
-                        fh.write(blob.encode("utf-8", "surrogateescape"))
-                    logger.info(
-                        "修复循环改过补丁，已用重放结果重建 complete.patch（%d 字节）"
-                        % len(blob)
-                    )
-                except OSError as e:  # noqa: BLE001
-                    logger.warning("写修复后的 complete.patch 失败: %s" % e)
+                    os.replace(complete_path, stale_path)
+                except OSError:
+                    pass
+            logger.error(
+                "Validated checkpoint could not be rebuilt into a complete patch; "
+                "removed the stale complete.patch so it cannot be reported as OK."
+            )
+            return
+
+        try:
+            write_patch_atomic(complete_path, fixed)
+            write_patch_atomic(
+                os.path.join(project.checkpoint_dir, "final-complete.patch"), fixed
+            )
+            project.succeeded_patches.clear()
+            project.succeeded_patches.append(fixed)
+            logger.info(
+                "Validated checkpoint rebuilt into complete.patch (%d bytes)"
+                % len(fixed.encode("utf-8", "surrogateescape"))
+            )
+        except OSError as e:  # noqa: BLE001
+            project.poc_succeeded = False
+            project.round_succeeded = False
+            logger.error("Writing rebuilt complete.patch failed: %s" % e)
+            return
+
+        if cumulative and cum_base:
+            # Chain validation must inspect the code produced by the rebuilt
+            # artifact, not the stale cumulative branch that preceded repair.
+            project.repo.git.reset("--hard")
+            project.repo.git.checkout(cum_base)
+            if not _try_apply(project, fixed):
+                project.repo.git.reset("--hard")
+                project.repo.git.checkout(data.target_release)
+                project.poc_succeeded = False
+                project.round_succeeded = False
+                logger.error("Rebuilt complete patch no longer applies to clean base")
+                return
+            global_complete, global_result = evaluate_global_artifact(
+                project, fixed, complete_path, ported_dir, hunks_by_idx,
+                selected_hunks, accepted_need_not_ported,
+                any_strict_requires_patch, cumulative,
+            )
+            project.repo.git.reset("--hard")
+            project.repo.git.checkout(data.target_release)
+            if not global_complete:
+                project.poc_succeeded = False
+                project.round_succeeded = False
+                stale_path = complete_path + ".stale"
+                try:
+                    os.replace(complete_path, stale_path)
+                except OSError:
+                    pass
+                logger.error(
+                    "Rebuilt patch failed final global validation; stale complete.patch removed"
+                )
+                return
         for patch in project.succeeded_patches:
             logger.info(patch)
     else:
