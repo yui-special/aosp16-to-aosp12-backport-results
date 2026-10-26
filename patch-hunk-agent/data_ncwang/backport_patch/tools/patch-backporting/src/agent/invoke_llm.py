@@ -399,6 +399,31 @@ def describe_group(group):
     return "\n".join(lines)
 
 
+def dump_portgpt_summary(ported_dir, gpos, label, payload):
+    """Persist the exact group summary payload supplied to a PortGPT session."""
+    try:
+        json_path = os.path.join(
+            ported_dir, "portgpt-input-%02d-%s.json" % (gpos, label)
+        )
+        with open(json_path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+        summary_path = os.path.join(ported_dir, "portgpt-summaries.md")
+        with open(summary_path, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write("# Group %d - %s\n\n" % (gpos, label))
+            fh.write("- target_release: `%s`\n" % payload.get("target_release", ""))
+            fh.write("- group_size: %s\n" % payload.get("group_size", ""))
+            fh.write("- group_ids: `%s`\n\n" % payload.get("group_ids", []))
+            fh.write("## Summary passed to PortGPT\n\n")
+            fh.write("```text\n%s\n```\n\n" % payload.get("group_desc", ""))
+            if payload.get("similar_block"):
+                fh.write("## Similar target blocks also passed to PortGPT\n\n")
+                fh.write("```text\n%s\n```\n\n" % payload["similar_block"])
+        logger.info("PortGPT summary written to %s", summary_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to write PortGPT summary: %s", exc)
+
+
 def do_backport(
     agent_executor: AgentExecutor,
     project: Project,
@@ -616,20 +641,19 @@ def do_backport(
             project.now_hunk_num = gpos
             # 每个 merged hunk 用一个新的 session（新的 AgentExecutor）来移植
             executor = make_agent(group) if make_agent is not None else agent_executor
+            payload = {
+                "project_url": data.project_url,
+                "new_patch_parent": data.new_patch_parent,
+                "new_patch": pp,
+                "target_release": data.target_release,
+                "similar_block": similar_block,
+                "group_size": len(group["hunks"]),
+                "group_ids": group["hunks"],
+                "group_desc": describe_group(group) + ledger_note(),
+            }
+            dump_portgpt_summary(ported_dir, gpos, "initial", payload)
             try:
-                executor.invoke(
-                    {
-                        "project_url": data.project_url,
-                        "new_patch_parent": data.new_patch_parent,
-                        "new_patch": pp,
-                        "target_release": data.target_release,
-                        "similar_block": similar_block,
-                        "group_size": len(group["hunks"]),
-                        "group_ids": group["hunks"],
-                        "group_desc": describe_group(group) + ledger_note(),
-                    },
-                    {"callbacks": [log_handler]},
-                )
+                executor.invoke(payload, {"callbacks": [log_handler]})
             except Exception as e:  # noqa: BLE001  -- [P0] 会话异常不许弄死整个运行
                 logger.error(
                     "%s 会话抛异常: %s: %s" % (group_tag, type(e).__name__, e)
@@ -671,20 +695,21 @@ def do_backport(
                 % (cov["missing"],)
             )
             executor = make_agent(group) if make_agent is not None else agent_executor
+            payload = {
+                "project_url": data.project_url,
+                "new_patch_parent": data.new_patch_parent,
+                "new_patch": pp,
+                "target_release": data.target_release,
+                "similar_block": "",
+                "group_size": len(group["hunks"]),
+                "group_ids": group["hunks"],
+                "group_desc": describe_group(group) + ledger_note() + note,
+            }
+            dump_portgpt_summary(
+                ported_dir, gpos, "retry-%02d" % attempts, payload
+            )
             try:
-                executor.invoke(
-                    {
-                        "project_url": data.project_url,
-                        "new_patch_parent": data.new_patch_parent,
-                        "new_patch": pp,
-                        "target_release": data.target_release,
-                        "similar_block": "",
-                        "group_size": len(group["hunks"]),
-                        "group_ids": group["hunks"],
-                        "group_desc": describe_group(group) + ledger_note() + note,
-                    },
-                    {"callbacks": [log_handler]},
-                )
+                executor.invoke(payload, {"callbacks": [log_handler]})
             except Exception as e:  # noqa: BLE001  -- [P0] 重试会话异常也不许弄死整个运行
                 logger.error(
                     "%s 重试会话抛异常: %s: %s" % (group_tag, type(e).__name__, e)
