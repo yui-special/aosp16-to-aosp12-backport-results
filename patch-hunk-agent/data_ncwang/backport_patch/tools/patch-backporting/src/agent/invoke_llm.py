@@ -22,6 +22,7 @@ from agent.prompt import (
     USER_PROMPT_PATCH,
 )
 from tools.logger import logger
+from tools.group_report import GroupComparison
 from tools.project import Project
 from tools.utils import (
     dump_merged_hunks,
@@ -514,6 +515,7 @@ def do_backport(
         "Backporting %d of %d merged hunk(s): indices %s"
         % (len(selected), len(merged_hunks), [i for i, _ in selected])
     )
+    group_comparison = GroupComparison(ported_dir, selected, logger)
 
     # 组内成员 hunk 的原文，用来做「这一组是否被完整移植」的机械校验
     _, all_hunks = split_patch_indexed(patch, True)
@@ -550,8 +552,34 @@ def do_backport(
         any_strict_requires_patch = any_strict_requires_patch or strict_requires_patch
         selected_hunks.update(int(i) for i in group.get("hunks", []))
 
+        group_base = None
+        if cumulative:
+            try:
+                group_base = project.repo.git.rev_parse(data.target_release)
+            except Exception as exc:  # Reporting must not affect porting.
+                logger.warning("Cannot read group %d base for comparison: %s", gpos, exc)
+
         def produced_patches():
             return list(project.succeeded_patches[n_before:])
+
+        def report_group():
+            if cumulative:
+                if group_base is None:
+                    group_comparison.record(gpos, "", "无法读取本组提交差异")
+                    return
+                try:
+                    output = project.repo.git.diff(group_base, data.target_release)
+                except Exception as exc:  # Reporting must not affect porting.
+                    logger.warning("Cannot read group %d diff for comparison: %s", gpos, exc)
+                    group_comparison.record(gpos, "", "无法读取本组提交差异")
+                    return
+            else:
+                # Each validation starts from the same ref; revisions replace
+                # the previous candidate rather than being stacked together.
+                patches = produced_patches()
+                output = patches[-1] if patches else ""
+            skipped = project.round_succeeded and not produced_patches() and not strict_requires_patch
+            group_comparison.record(gpos, output, "无需移植" if skipped else "未产出补丁")
 
         def save_ported():
             """把本组产出的 patch 存到 ported/merged-hunk-NN.patch。"""
@@ -671,6 +699,7 @@ def do_backport(
                 ledger.extend(produced_patches())
                 if cumulative:
                     commit_group(project, produced_patches(), gpos, group)
+                report_group()
                 continue
 
         # ---- 后置校验：这一组是不是真的被完整移植了 -------------------------
@@ -737,6 +766,7 @@ def do_backport(
             if os.environ.get("PG_COMPILE_PER_GROUP") == "1":
                 compile_group(project, data, gpos,
                               os.path.join(ported_dir, "compile-per-group.log"))
+        report_group()
         if cov["complete"]:
             logger.debug(
                 "%s 覆盖校验通过（%d 个成员 hunk 都有痕迹）"

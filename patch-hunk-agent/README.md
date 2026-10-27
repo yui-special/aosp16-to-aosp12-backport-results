@@ -54,6 +54,15 @@ environments, backups and secrets are intentionally excluded.
 8. `chain_check.py` checks changed call signatures and `make_verdict.py`
    produces the final case verdict.
 
+## Per-group comparison
+
+`merged_hunks/ported/group-comparison.md` contains each group number, original
+hunk IDs, and inline before/after patches. In cumulative mode the after patch is
+the group's committed diff; whole-patch repairs are a later stage. Empty results
+remain in place. Each completed group is also printed to the log.
+`--only-group N` preserves the original group number. The generic runner copies
+the report into the results directory.
+
 The grouping stage caps each connected component at `MAX_GROUP_HUNKS` (default
 8) so a large transitive component cannot dilute one model session. Summary
 relations are indexed from `symbol`, discovered declarations and
