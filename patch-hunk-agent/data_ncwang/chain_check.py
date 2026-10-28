@@ -101,10 +101,16 @@ def looks_like_declaration(text, match):
 
 
 def call_sites(repo, name, pathspecs):
-    cmd = ["git", "-C", repo, "grep", "-n", "-F", name + "(", "--"]
+    ref = os.environ.get('CHAIN_CHECK_REF', '')
+    cmd = ["git", "-C", repo, "grep", "-n", "-F", name + "("]
+    if ref:
+        cmd.append(ref)
+    cmd.append('--')
     cmd += pathspecs or DEFAULT_GLOBS
     p = subprocess.run(cmd, capture_output=True, text=True)
     for line in p.stdout.split("\n"):
+        if ref and line.startswith(ref + ':'):
+            line = line[len(ref) + 1:]
         if not line.strip():
             continue
         try:

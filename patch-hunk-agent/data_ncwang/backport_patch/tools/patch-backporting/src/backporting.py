@@ -63,6 +63,18 @@ def load_yml(file_path: str):
     data.project_dir = config.get("project_dir")
     data.patch_dataset_dir = config.get("patch_dataset_dir")
     data.openai_key = config.get("openai_key")
+    for name in ("llm_base_url", "llm_model", "coverage_model"):
+        if config.get(name):
+            setattr(data, name, config[name])
+    for name, default, minimum in (
+        ('llm_timeout_seconds', 300, 1), ('llm_max_retries', 1, 0),
+        ('coverage_retries', 0, 0), ('coverage_review_iterations', 20, 1),
+        ('coverage_review_retries', 1, 0), ('final_repair_iterations', 20, 1),
+    ):
+        value = config.get(name, default)
+        if type(value) is not int or value < minimum:
+            raise ValueError('%s must be an integer >= %d' % (name, minimum))
+        setattr(data, name, value)
     data.tag = config.get("tag")
 
     # Azure OpenAI configuration (optional)
@@ -200,7 +212,7 @@ def main():
         "--coverage-retries",
         type=int,
         default=None,
-        help="某一组的产出没覆盖全部成员 hunk 时，最多重试几次（默认 1，0 = 只报不重试）",
+        help="组内启发式覆盖检查的重试次数（默认读取配置，否则为 0）；最终语义审查独立执行",
     )
     parser.add_argument(
         "--allow-incomplete-groups",

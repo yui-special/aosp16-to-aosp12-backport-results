@@ -12,7 +12,8 @@ import ssl
 import urllib.error
 import urllib.request
 
-sys.path.insert(0, "/data/ncwang/backport_patch/tools/patch-backporting/src")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "backport_patch/tools/patch-backporting/src"))
 from tools.utils import split_patch_indexed  # noqa: E402
 
 BASE = os.environ.get("LLM_BASE_URL", "https://endpoint.greatrouter.com/v1").rstrip("/")
@@ -52,6 +53,8 @@ semantic_contract 必须描述修复语义，而不是只复述代码。字段�
   search_terms        —— 在目标仓库中搜索等价实现时使用的 3~12 个精确标识符、方法名、类名、字符串或注释短语
   obligations         —— 移植后必须逐项满足的 1~6 条语义义务
 
+依赖描述应聚焦本 hunk 的行为变化：区分必须同步修改的接口/状态约束和仅供理解的普通调用。
+不要仅因同文件、同函数或共用 helper 就声称必须一起修改；prerequisite_semantics 只写具体必要前提。
 不要猜测目标版本中一定存在哪些符号；search_terms 只用于搜索候选，不能当成等价证明。
 非代码或 noise hunk 的 semantic_contract 可以字段为空，但仍要输出全部字段。
 
@@ -82,12 +85,18 @@ except Exception:
     _SSL_CTX = None
 
 
-def call(key, model, prompt):
+def call(key, model, prompt, request_options=None, read_timeout=60.0):
     url = BASE.rstrip("/") + "/chat/completions"
     body = {"model": model, "messages": [
         {"role": "system", "content": SYS},
         {"role": "user", "content": prompt},
     ]}
+    if request_options is not None:
+        if not isinstance(request_options, dict) or set(request_options) & {"model", "messages", "stream"}:
+            raise ValueError("request_options must be an object without model/messages/stream overrides")
+        body.update(request_options)
+    if not 0 < float(read_timeout) < float("inf"):
+        raise ValueError("read_timeout must be a finite positive number")
     import httpx
     last = None
     for attempt in range(4):
@@ -95,10 +104,24 @@ def call(key, model, prompt):
             with httpx.Client(verify=_SSL_CTX or True,
                               transport=httpx.HTTPTransport(local_address="0.0.0.0",
                                                             verify=_SSL_CTX or True),
-                              timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+                              timeout=httpx.Timeout(float(read_timeout), connect=10.0)) as client:
                 r = client.post(url, headers={"Authorization": "Bearer " + key},
                                 json=body)
-                return r.json()["choices"][0]["message"]["content"]
+                payload = r.json()
+                choices = payload.get("choices") if isinstance(payload, dict) else None
+                if not choices:
+                    error = payload.get("error", {}) if isinstance(payload, dict) else {}
+                    message = error.get("message", "missing choices") if isinstance(error, dict) else str(error)
+                    message = re.sub(r"sk-[A-Za-z0-9_-]+", "[redacted]",
+                                     str(message).replace(key, "[redacted]"))[:500]
+                    last = RuntimeError("LLM_RESPONSE_ERROR http=%s: %s" % (r.status_code, message))
+                    code = error.get("code") if isinstance(error, dict) else None
+                    no_quota = (code in {"insufficient_quota", "insufficient_balance"}
+                                or "balance is insufficient" in message.lower())
+                    if no_quota or (400 <= r.status_code < 500 and r.status_code != 429):
+                        break
+                    raise last
+                return choices[0]["message"]["content"]
         except Exception as e:  # noqa: BLE001
             last = e
             time.sleep(2)
@@ -148,9 +171,9 @@ def normalize_contract(obj):
     return out
 
 
-def call_json(key, model, prompt):
+def call_json(key, model, prompt, request_options=None, read_timeout=60.0):
     """Ask for one JSON object and repair malformed output in-place."""
-    raw = call(key, model, prompt)
+    raw = call(key, model, prompt, request_options=request_options, read_timeout=read_timeout)
     try:
         return parse_json(raw)
     except Exception as first_error:  # noqa: BLE001
@@ -159,7 +182,7 @@ def call_json(key, model, prompt):
             "解析错误：%s\n\n原任务：\n%s\n\n上一条回答：\n%s" %
             (first_error, prompt, raw[:24000])
         )
-        repaired = call(key, model, repair)
+        repaired = call(key, model, repair, request_options=request_options, read_timeout=read_timeout)
         try:
             return parse_json(repaired)
         except Exception as second_error:  # noqa: BLE001

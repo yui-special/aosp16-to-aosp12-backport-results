@@ -2,3 +2,5 @@
 *.tmp
 .DS_Store
 node_modules/
+/patch-hunk-agent/**/__pycache__/
+/patch-hunk-agent/**/*.py[cod]

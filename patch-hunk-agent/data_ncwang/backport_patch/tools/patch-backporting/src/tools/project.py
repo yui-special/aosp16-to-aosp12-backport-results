@@ -15,6 +15,7 @@ from langchain_core.tools import tool
 
 import tools.utils as utils
 from tools.logger import logger
+from tools.source_structure import SymbolIndex
 
 
 class Project:
@@ -42,18 +43,21 @@ class Project:
         self.full_patch_base = None
         self.validated_complete_patch = None
         self.symbol_map = {}
+        self.source_index = SymbolIndex(self.dir)
         self.now_hunk = ""
         self.now_hunk_num = 0
         self.hunk_log_info = {}
         self.add_percent = 0
         self.last_context = []
+        self.no_change_evidence = None
+        self.final_artifact_check = None
         # [P0] 文件"搬移推断"的递归深度（只允许一层，避免 5^k 重试爆炸）
         self._move_depth = 0
 
     def persist_validated_patch(self, patch: str, ref: str):
         """Persist a successfully validated candidate immediately.
 
-        The candidate may be a full patch or a revision fragment. It is kept as
+        The candidate is a full patch against full_patch_base. It is kept as
         a checkpoint so a later gateway disconnect cannot erase work already
         accepted by `validate`.
         """
@@ -63,6 +67,7 @@ class Project:
             return None
 
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        ref = self.full_patch_base or ref
         canonical = patch
         if self.full_patch_base:
             try:
@@ -117,35 +122,8 @@ class Project:
             return "Error commit id, please check if the commit id is correct."
 
     def _prepare(self, ref: str) -> None:
-        """
-        Prepares the project by generating a symbol map using ctags.
-
-        Raises:
-            subprocess.CalledProcessError: If the ctags command fails.
-        """
-        ctags = subprocess.run(
-            ["ctags", "--excmd=number", "-R", "."],
-            stdout=subprocess.PIPE,
-            cwd=self.dir,
-            stdin=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        ctags.check_returncode()
-
-        self.symbol_map[ref] = {}
-        with open(os.path.join(self.dir, "tags"), "rb") as f:
-            for line in f.readlines():
-                if text := line.decode("utf-8", errors="ignore"):
-                    if text.startswith("!_TAG_"):
-                        continue
-                    try:
-                        symbol, file, lineno = text.strip().split(';"')[0].split("\t")
-                        lineno = int(lineno)
-                        if symbol not in self.symbol_map[ref]:
-                            self.symbol_map[ref][symbol] = []
-                        self.symbol_map[ref][symbol].append((file, lineno))
-                    except:
-                        continue
+        """Build a Tree-sitter index from this revision without changing the checkout."""
+        self.symbol_map[ref] = self.source_index.prepare(ref)
 
     def _viewcode(self, ref: str, path: str, startline: int, endline: int) -> str:
         """
@@ -204,15 +182,7 @@ class Project:
         Returns:
             List[Tuple[str, int]] | None: File path and code lines.
         """
-        # XXX: Analyzing ctags file everytime locate symbol is time-consuming.
-        if ref not in self.symbol_map:
-            self._checkout(ref)
-            self._prepare(ref)
-
-        if symbol in self.symbol_map[ref]:
-            return self.symbol_map[ref][symbol]
-        else:
-            return None
+        return self.source_index.locate(ref, symbol)
 
     def _locate_similar_symbol(
         self, ref: str, symbol: str
@@ -227,8 +197,8 @@ class Project:
         Returns:
             List[Tuple[str, int]] : File path and code lines for the most similar symbol.
         """
-        # XXX: Analyzing ctags file everytime locate symbol is time-consuming.
-        symbols = self.symbol_map.get(ref, {})
+        self._prepare(ref)
+        symbols = self.symbol_map[ref]
         most_similar = None
         smallest_distance = float("inf")
 
@@ -611,37 +581,42 @@ class Project:
             subprocess.TimeoutExpired: If the compilation process times out.
 
         """
-        # apply joined patch
-        self._checkout(ref)
+        # Full candidates always replace the previous attempt on the original
+        # base. Do not use _checkout's fallback or rewrite source context.
+        base = self.full_patch_base or ref
+        self.repo.git.reset("--hard")
+        try:
+            self.repo.git.checkout(base)
+            if self.repo.git.rev_parse("HEAD") != self.repo.git.rev_parse(base):
+                raise ValueError("checkout did not select the validation base")
+        except Exception as exc:
+            return "VALIDATION_BASE_ERROR: cannot check out %s: %s\n" % (base, exc)
         ret = ""
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-            f.write(complete_patch)
-            logger.debug(f"The completed patch file {f.name}")
-        pps = utils.split_patch(complete_patch, False)
-        for idx, pp in enumerate(pps):
-            revised_patch, fixed = utils.revise_patch(pp, self.dir, revise_context)
-            with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-                f.write(revised_patch)
-            try:
-                # XXX 这里应该把修正后的patch加到结果里面
-                self.repo.git.apply([f.name], v=True)
-                logger.debug(
-                    f"The joined patch hunk {idx} could be applied successfully, file {f.name}"
-                )
-            except Exception as e:
-                logger.debug(
-                    f"Failed to apply Complete patch hunk {idx}, file {f.name}"
-                )
-                # TODO: give feedback to LLM about which line can not be applied
-                ret = f"For the patch you just generated, there was an APPLY failure during testing. Specifically there was a context mismatch in hunk {idx} across the patch, below is part of the feedback I found for you.\n"
-                block, differ = self._apply_error_handling(ref, revised_patch)
-                ret += block
-                ret += f"Here is the source code near the hunk context for your reference, a good patch context should look exactly like the source code.\n"
-                ret += f"In addition to that, I've got more detailed error messages for you below where the context of your generated patch differs specifically from the source code context.(The line numbers below are all line numbers in the hunk, not the entire patch.)\n"
-                ret += differ
-                ret += f"Based on the above feedback, MUST you please modify only hunk {idx} in the patch and leave the other hunks untouched so that the context present in hunk {idx} is exactly the same as the source code to guarantee that git apply can be executed normally.\n"
-                self.repo.git.reset("--hard")
-                return ret
+        blob = complete_patch if complete_patch.endswith("\n") else complete_patch + "\n"
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         errors="surrogateescape", delete=False) as handle:
+            handle.write(blob)
+            patch_path = handle.name
+        try:
+            # --recount fixes hunk line counts only; --index includes new files
+            # in the canonical checkpoint and makes reset undo failed attempts.
+            self.repo.git.apply("--check", "--index", "--recount", patch_path)
+            self.repo.git.apply("--index", "--recount", patch_path)
+        except Exception as exc:
+            self.repo.git.reset("--hard")
+            return (
+                "APPLY_FAILED on original base %s. Submit the complete revised patch "
+                "against this base, not a fragment against previous changes. "
+                "Context is not rewritten automatically. Inspect this ref with viewcode.\n%s\n"
+                % (base, getattr(exc, "stderr", str(exc)))
+            )
+        finally:
+            os.unlink(patch_path)
+
+        if self.final_artifact_check is not None:
+            failure = self.final_artifact_check(complete_patch)
+            if failure:
+                return failure + '\nSubmit a complete revised patch addressing these obligations.\n'
 
         # compile the patch
         logger.debug("Start compile the patched source code")
@@ -837,7 +812,7 @@ class Project:
             self.poc_succeeded = True
         return ret
 
-    def _validate(self, ref: str, patch: str) -> str:
+    def _validate(self, ref: str, patch: str, evidence: str = '') -> str:
         """
         Validates a patch by using the `_compile_patch`, `_run_testcase`, and `_run_poc` methods.
 
@@ -850,12 +825,11 @@ class Project:
 
         """
         if self.all_hunks_applied_succeeded:
-            ret = ""
-            if not self.compile_succeeded:
-                ret += self._compile_patch(
-                    ref, patch, True if self.context_mismatch_times >= 1 else False
-                )
-                self.context_mismatch_times += 1
+            # A new candidate must never inherit a previous candidate's success.
+            self.compile_succeeded = False
+            self.testcase_succeeded = False
+            self.poc_succeeded = False
+            ret = self._compile_patch(self.full_patch_base or ref, patch)
             if self.compile_succeeded and not self.testcase_succeeded:
                 ret += self._run_testcase()
             if (
@@ -866,9 +840,18 @@ class Project:
                 ret += self._run_poc(patch)
             return ret
         else:
-            if "need not ported" in patch:
+            if patch.strip() == "need not ported":
+                if not evidence.strip():
+                    self.round_succeeded = False
+                    return ('NO_CHANGE_EVIDENCE_REQUIRED: explain each member using concrete target '
+                            'files, symbols, and behavior. Distinguish already satisfied by earlier '
+                            'groups from genuinely inapplicable. A missing upstream name is insufficient.\n')
+                self.no_change_evidence = {'reason': evidence, 'ref': self.repo.git.rev_parse(ref),
+                                           'status': 'pending_final_semantic_review'}
                 self.round_succeeded = True
-                return "Patch applied successfully\n"
+                return ('NO_CHANGE_RECORDED: explanation saved for independent final semantic review. '
+                        'No patch was applied and coverage has not been accepted. Finish this group '
+                        'with the per-hunk explanation; compilation and tests have not run.\n')
 
             ret = self._apply_hunk(
                 ref, patch, True if self.context_mismatch_times >= 2 else False
@@ -898,7 +881,11 @@ def creat_locate_symbol_tool(project: Project):
             return "\n".join([f"{file}:{line}" for file, line in res])
         else:
             res, most_similar = project._locate_similar_symbol(ref, symbol)
-            ret = f"The symbol {symbol} you are looking for does not exist in the current ref.\n"
+            ret = (f"No parsed definition of {symbol} was found at this ref. "
+                   "Unsupported syntax/languages may be missing from the index; "
+                   "this is not proof that the implementation is absent.\n")
+            if not res:
+                return ret + "No similar parsed definition was found. Inspect the source paths directly.\n"
             ret += f"But here is a symbol similar to it. It's `{most_similar}`.\n"
             ret += f"The file where this symbol is located is: \n"
             ret += "\n".join([f"{file}:{line}" for file, line in res])
@@ -921,11 +908,12 @@ def creat_viewcode_tool(project: Project):
 
 def create_validate_tool(project: Project):
     @tool
-    def validate(ref: str, patch: str) -> str:
+    def validate(ref: str, patch: str, evidence: str = '') -> str:
         """
-        validate a patch on a specific ref of the target repository.
+        Validate a patch on a target ref. For "need not ported", evidence must explain
+        each hunk using target files/symbols; the decision remains pending final review.
         """
-        ret = project._validate(ref, patch)
+        ret = project._validate(ref, patch, evidence)
         if project.poc_succeeded:
             project.persist_validated_patch(patch, ref)
         return ret

@@ -81,7 +81,7 @@ class GroupComparisonTests(unittest.TestCase):
         for i, item in enumerate(groups):
             item["hunks"] = [i]
         project = SimpleNamespace(
-            repo=MagicMock(), succeeded_patches=[], round_succeeded=False,
+            repo=MagicMock(), dir=str(self.directory), succeeded_patches=[], round_succeeded=False,
             _get_patch=lambda _: "upstream fixture",
         )
 
@@ -104,9 +104,10 @@ class GroupComparisonTests(unittest.TestCase):
         with patch.object(runtime, "logger", self.logger), \
                 patch.object(runtime, "group_patch", return_value=("", groups)), \
                 patch.object(runtime, "split_patch_indexed", return_value=("", hunks)), \
-                patch.object(runtime, "evaluate_global_artifact", return_value=(False, {})):
-            runtime.do_backport(executor, project, data, None,
-                                str(self.directory / "runtime.log"))
+                patch.object(runtime, "evaluate_global_artifact", side_effect=StopIteration('report boundary')):
+            with self.assertRaises(StopIteration):
+                runtime.do_backport(executor, project, data, None,
+                                    str(self.directory / "runtime.log"))
         report_path = self.directory / "merged_hunks/ported/group-comparison.md"
         text = report_path.read_text()
         for i in range(3):
@@ -138,7 +139,7 @@ class GroupComparisonTests(unittest.TestCase):
         original = group(0)
         original["hunks"] = [0]
         original["text"] = "+void repaired() {}\n"
-        project = SimpleNamespace(repo=repo, succeeded_patches=[], round_succeeded=False,
+        project = SimpleNamespace(repo=repo, dir=repo.working_tree_dir, succeeded_patches=[], round_succeeded=False,
                                   _get_patch=lambda _: "upstream fixture",
                                   _apply_hunk=lambda *args: "context mismatch")
 
@@ -155,10 +156,11 @@ class GroupComparisonTests(unittest.TestCase):
         with patch.object(runtime, "logger", self.logger), \
                 patch.object(runtime, "group_patch", return_value=("", [original])), \
                 patch.object(runtime, "split_patch_indexed", return_value=("", hunks)), \
-                patch.object(runtime, "evaluate_global_artifact", return_value=(False, {})), \
+                patch.object(runtime, "evaluate_global_artifact", side_effect=StopIteration('report boundary')), \
                 patch.dict("os.environ", {"PG_COMPILE_PER_GROUP": "0"}):
-            runtime.do_backport(SimpleNamespace(invoke=invoke), project, data, None,
-                                str(self.directory / "runtime.log"))
+            with self.assertRaises(StopIteration):
+                runtime.do_backport(SimpleNamespace(invoke=invoke), project, data, None,
+                                    str(self.directory / "runtime.log"))
         report_path = self.directory / "merged_hunks/ported/group-comparison.md"
         after = report_path.read_text().split("### 移植后", 1)[1]
         self.assertEqual(after.count("void repaired()"), 1)

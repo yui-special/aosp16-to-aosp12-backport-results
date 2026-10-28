@@ -18,7 +18,8 @@ import time
 import urllib.error
 import urllib.request
 
-sys.path.insert(0, "/data/ncwang/backport_patch/tools/patch-backporting/src")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "backport_patch/tools/patch-backporting/src"))
 from tools.utils import split_patch_indexed  # noqa: E402
 
 BASE = os.environ.get("LLM_BASE_URL", "https://endpoint.greatrouter.com/v1").rstrip("/")
@@ -35,10 +36,13 @@ def _alarm(signum, frame):
 TPL = """上游提交里混着三类内容：
   ① fix       —— 目标 CVE 的修复语义，必须移植
   ② metadata  —— 版本号/元数据/升级产物（SQLITE_VERSION、METADATA、README.version、Android.patch 等），不要移植
-  ③ unrelated —— 与目标 CVE 无关的其他上游改动（重构、别的 bugfix、依赖目标版本不存在的新设施），不要移植
+  ③ unrelated —— 与目标 CVE 无关的其他上游改动（独立重构、别的 bugfix、非必要的测试设施），不要移植
 
 CVE 描述：{desc}
 目标版本通常比上游旧，上游新增的设施在目标里可能不存在。
+先判断该改动与修复语义是否相关；上游类名、函数名或文件在目标缺失，不构成无关的证据。
+修复逻辑及其必要测试需要映射到目标的等价实现。纯粹为上游测试管理功能开关的
+Rule、导入或测试运行器，若不改变修复行为且目标不需要该设施，应判 unrelated。
 
 hunk 所在文件：{file}
 这个 hunk 在函数里做了什么（摘要）：{summary}
@@ -152,42 +156,14 @@ def _mapping_terms(summary):
 
 def postprocess(rows, hunks, summaries, repo, target_ref):
     """Mechanical safeguards around the LLM decisions."""
-    # Rule 1: a missing upstream function name is NOT enough to skip. Before skipping,
-    # search the semantic-contract terms. A hit means this hunk needs target mapping;
-    # only the absence of all strong terms permits a skip.
-    for r, h, s in zip(rows, hunks, summaries):
-        enc = (s.get("det_enclosing") or s.get("enclosing") or "").strip()
-        if not enc or enc in ("-", "(new file)") or not repo:
-            continue
-        cnt = git_count(repo, target_ref, enc)
-        r["func_in_target"] = cnt
-        if cnt != 0:
-            continue
-
-        term_hits = {}
-        for term in _mapping_terms(s):
-            if term == enc:
-                continue
-            term_count = git_count(repo, target_ref, term)
-            if term_count > 0:
-                term_hits[term] = term_count
-        r["semantic_candidates"] = term_hits
-        if term_hits:
-            # The name disappeared, but the behavior may have been renamed/moved or
-            # split across old target functions. Never silently turn this into skip.
-            r["port"] = True
-            r["category"] = "fix"
-            r["needs_semantic_mapping"] = True
-            r["reason"] = (r.get("reason") or "") + (
-                " | 目标无原名 %s，但语义搜索命中 %s；必须做等价映射" %
-                (enc, ", ".join(sorted(term_hits)[:6]))
-            )
-        elif r.get("port"):
-            r["port"] = False
-            r["category"] = "unrelated"
-            r["reason"] = (r.get("reason") or "") + (
-                " | 目标版本不存在函数 %s，且语义搜索无候选" % enc
-            )
+    # Relevance is decided here; target equivalence is checked by the dedicated
+    # mapping stage. Repeating repository-wide keyword searches here both
+    # conflates those decisions and promotes unrelated framework vocabulary.
+    for row in rows:
+        row.setdefault("initial_decision", {k: row.get(k) for k in ("port", "category", "reason")})
+        row.pop("func_in_target", None)
+        row.pop("semantic_candidates", None)
+        row["needs_semantic_mapping"] = row.get("port") is True
 
     # 规则 2/3 需要迭代到不动点：提升一个 hunk 后，它可能又拉出新的依赖
     for _round in range(5):

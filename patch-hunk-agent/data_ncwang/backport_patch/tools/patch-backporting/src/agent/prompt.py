@@ -114,10 +114,12 @@ Below is the patch I form, we call it complete_patch:
 {complete_patch}
 ```
 
-Now, I have tried to compiled the patched code, the result is:
+The current validation result (semantic coverage, application, compilation, or tests) is:
 {compile_ret}
 
-You can VALIDATE the patch with provided tool `validate`. There are 3 processes to validate if the patch can fix the vuln:
+Use `validate` with the complete replacement patch. Semantic coverage is checked against
+the actual candidate first; missing obligations must be repaired before compilation.
+After semantic validation, the validation stages are:
 1. Compile. The patched software should  compile without any errors.
 2. PoC (Proof of Concept). The patched software should not trigger the bug under the PoC.
 3. Testcase. The patched software should pass the testcase.
@@ -128,7 +130,14 @@ If the patch can not pass above validation, you need to REVISE the patch with th
 3. Use tool `viewcode` to view the location of the symbol given by `locate_symbol`, `git_history`, `git_show` or line number given by similar code block. Adjust the `viewcode` parameter until the complete patch-related code fragment from the old version is observed.
 4. Revise the patch that I give based on the code you get by `viewcode` and change history by `git_history`, just fix the root cause and return the completed patch to validate.
 
-Please start to VALIDATE the patch and REVISE it if necessary. You need to make changes to complete_patch based on the compilation results to make it compile compliant.
+The target ref {target_release} is the original, unmodified validation base.
+Every validate call must use that ref and contain the COMPLETE replacement patch.
+Earlier group changes are already represented in complete_patch; include each exactly once.
+Read source context from this base. Do not submit a delta against a previously patched tree,
+and do not use the cumulative branch as the validation base. Context mismatches must be
+fixed in your patch; the validator will not rewrite source context or stack candidates.
+
+Revise complete_patch according to the reported semantic gaps or build/test failures.
 """
 
 SYSTEM_PROMPT_PTACH = """
@@ -150,9 +159,9 @@ You have 3 tools: `viewcode` `locate_symbol` and `validate`
 0. ref: the commit hash of the ref you want to view the file from.
 1. symbol: the function name you want to locate in the codebase.
 
-- `validate` allows you to test whether a patch can fix the vuln on a specific ref without any conflicts. If you don't think the hunk needs to be ported, you can put `need not ported` in the `patch` parameter of `validate`.
+- `validate` checks the COMPLETE replacement patch on the immutable original base given by the user. Each attempt starts clean; fragments and `need not ported` are not valid final candidates.
 0. ref: the commit hash of the ref you want to test the patch on.
-1. patch: the patch you want to test. Each line of patch must start with `+`, `-` or ` ` (space) and use tab indentation. If migration is not required, put `need not ported`.
+1. patch: the complete patch relative to that original base, including all retained group changes exactly once. Preserve source indentation and correct unified-diff context.
 
 [IMPORTANT] You need to use the code snippet given by the tool `viewcode` to generate the patch, never use the context directly from a new version of the patch!
 
@@ -205,11 +214,25 @@ mutually dependent hunks (a "merged hunk") taken from the same fix. They MUST be
 backported TOGETHER, as ONE unit: some hunks of the group introduce or update a symbol,
 an interface method or a parameter, and the other hunks of the group use it.
 If you port only a part of the group, the result will not compile or will be
-semantically wrong. The patch you finally validate MUST contain every hunk of the group.
+semantically wrong. The patch you finally validate must satisfy every applicable member's
+semantic obligations; this does not require a separate target edit for each upstream hunk.
 
 Before editing, identify for every hunk: the enclosing function's responsibility, its
 callers and callees, and the data/control/return/side-effect relationship between them.
 A target path match without the same reachable call chain is NOT semantic equivalence.
+
+Plan changes by verified TARGET implementation, not by upstream hunk count. Several
+upstream wrappers, interfaces or implementations may correspond to one target method.
+Inspect the target definitions and callers, including signatures and overloads, before
+combining their obligations. Implement the combined obligations once in that existing
+target method; do not add duplicate methods, parameters or checks to represent each hunk.
+Preserve distinct obligations even when they share a location. Equal names alone do not
+prove equivalence, and distinct target implementations must each receive their changes.
+Do not recreate an upstream service layer solely to mirror its structure when the verified
+target call chain already implements its role. Add prerequisites only where that chain
+actually lacks required behavior. When earlier groups are already applied, read and reuse
+their definitions. Before validation, check that shared definitions and guards occur only
+where needed and that each member's obligations are accounted for.
 """
 )
 
@@ -223,10 +246,14 @@ USER_PROMPT_HUNK_GROUP = USER_PROMPT_HUNK.replace(
     """[IMPORTANT] What you get here is NOT a single hunk, but a GROUP of {group_size} hunks
 (a "merged hunk"; original upstream hunk ids: {group_ids}). Process them TOGETHER, but
 decide EACH hunk separately:
-  - every hunk you decide to port must appear in YOUR patch;
+  - every applicable hunk must have its semantic obligations covered by the cumulative target;
+    one verified target change may cover several upstream hunks. Explain that correspondence
+    by original hunk ID; do not duplicate the change or mark a member not-needed merely
+    because its obligations are satisfied by the same target edit as another member;
   - for every hunk you decide does NOT need porting you MUST say so explicitly
-    (call `validate` with `need not ported`, and/or list it in your final answer)
-    together with a concrete reason.
+    call `validate` with patch="need not ported" and a nonempty evidence argument citing
+    target files/symbols and the per-hunk reason. NO_CHANGE_RECORDED means the explanation
+    was saved for independent final review; it is not a validation success.
   - the group must stay SELF-CONSISTENT: if these hunks form one signature/call chain,
     either port the whole chain, or declare the whole chain not-needed with reasons.
 
@@ -236,11 +263,13 @@ Rules for "does not need porting" (do not abuse this):
      or an entire upstream feature, port the required prerequisite chain instead of skipping;
   b) if an equivalent function/class exists, rewrite the change against it, preserving the
      caller -> callee relationship and all semantic obligations;
-  c) `need not ported` requires a complete target call-path proof: show that no reachable path
-     can exercise the vulnerable behavior and explain why every contract obligation is absent.
-     "The upstream symbol/new code does not exist" is NOT such proof;
-  d) UNRESOLVED and REQUIRES_PREREQUISITE mappings require a real patch or an explicit group
-     failure. They can never be silently converted to an empty success;
+  c) distinguish already satisfied from not applicable. When earlier groups already implement
+     an obligation, cite the actual cumulative target implementation and tests; do not duplicate
+     edits. For not applicable, prove why no equivalent target obligation exists. Missing an
+     upstream symbol is not proof;
+  d) UNRESOLVED and REQUIRES_PREREQUISITE mappings describe the original target. Earlier groups
+     may have supplied the missing behavior. Inspect the current target; any remaining applicable
+     obligation requires a real patch. Unsupported no-change claims fail the final review;
   e) a hunk whose mapping status is UNRESOLVED is not evidence of absence. Search the
      target call chain and implement the semantic contract. You may use `need not ported`
      only after citing concrete target files/symbols that prove every obligation is
