@@ -151,6 +151,26 @@ class A {
             self.assertTrue((Path(directory)/'summaries_with_enclosing.json').is_file())
             self.assertFalse((Path(directory)/'groups.json').exists())
 
+    def test_empty_triage_keeps_explicit_exclusions_and_review_hints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            triage = root/'triaged.json'
+            triage.write_text(json.dumps([
+                {'hunk': 0, 'port': False, 'review_required': True, 'closure_symbols': ['shared']},
+                {'hunk': 1, 'port': False}]))
+            args = ['v6_group.py', '--triage', str(triage), 'repo', 'commit', 'target',
+                    'patch', 'summary', directory]
+            with patch.object(sys, 'argv', args), \
+                    patch.object(self.module, 'build', return_value=([], [], [], [], {})), \
+                    patch.object(self.module, 'semantic_groups') as planner:
+                self.module.main()
+            planner.assert_not_called()
+            spec = json.loads((root/'groups.json').read_text())
+            self.assertEqual(spec['groups'], [])
+            self.assertEqual(spec['excluded_hunks'], [0, 1])
+            self.assertEqual(spec['review_only_hunks'], [0])
+            self.assertEqual(spec['skipped'][0]['closure_symbols'], ['shared'])
+
     def test_signature_self_audit_cannot_contradict_the_partition(self):
         audit = [{'signature': 'I.send(x) -> I.send(x, mode)',
                   'definition_hunks': [0], 'affected_call_hunks': [1]}]
@@ -338,12 +358,15 @@ class A {
             patch_text = ("diff --git a/A.java b/A.java\n--- a/A.java\n+++ b/A.java\n"
                           "@@ -1 +1 @@\n-oldA\n+newA\n"
                           "diff --git a/B.java b/B.java\n--- a/B.java\n+++ b/B.java\n"
-                          "@@ -1 +1 @@\n-oldB\n+newB\n")
+                          "@@ -1 +1 @@\n-oldB\n+newB\n"
+                          "diff --git a/C.java b/C.java\n--- a/C.java\n+++ b/C.java\n"
+                          "@@ -1 +1 @@\n-oldC\n+newC\n")
             (root/'input.patch').write_text(patch_text)
             details = [entry([0]), entry([1], [0])]
             details[0]['goal'] = 'Introduce prerequisite'
             details[1]['goal'] = 'Use existing prerequisite'
             spec = {'groups': [[0], [1]], 'group_details': details,
+                    'excluded_hunks': [2], 'review_only_hunks': [2],
                     'hunks': [{'hunk': i, 'file': name, 'summary': 'fixture'}
                               for i, name in enumerate(['A.java', 'B.java'])]}
             (root/'groups.json').write_text(json.dumps(spec))
@@ -356,11 +379,18 @@ class A {
                 str(root/'export'), str(root/'mapping.json')], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             index = json.loads((root/'export/merged_hunks/original/index.json').read_text())
+            self.assertEqual(len(index), 2)
             for actual, expected in zip(index, details):
                 self.assertEqual(actual['hunks'], expected['hunks'])
                 self.assertTrue(actual['concern'].startswith(expected['goal']))
                 self.assertEqual(actual['why'], expected['why_together'])
             self.assertIn('Prerequisites in earlier groups: hunks [0]', index[1]['hints'])
+            exported = json.loads((root/'export/hunk_groups.json').read_text())
+            self.assertEqual(exported['excluded_hunks'], [2])
+            self.assertEqual(exported['review_only_hunks'], [2])
+            from tools.utils import group_patch
+            _, loaded = group_patch(patch_text, exported, True)
+            self.assertEqual([g['hunks'] for g in loaded], [[0], [1]])
 
     def test_provider_quota_error_is_reported_without_key_or_retries(self):
         module = load_client()

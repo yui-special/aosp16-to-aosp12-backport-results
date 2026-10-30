@@ -65,6 +65,13 @@ Quotes and hunk coverage are validated, but this is not a proof of semantic
 equivalence. Reviewed dependencies are tied to the patch and source revisions;
 they impose ordering without automatically merging an entire API chain.
 
+Same-name skipped hunks carry `review_required` / `review_only_hunks` hints without
+changing their port decision. Explicit `excluded_hunks` survive grouping, export
+and loading, so fallback grouping cannot reinsert them. Port-required and excluded
+sets must not overlap. Review-only hints are retained for inspection; they do not
+represent a completed target-applicability review or enter the final selected-hunk
+coverage gate. Concrete, evidenced prerequisites can still retain a skipped hunk.
+
 ## Per-group comparison
 
 `merged_hunks/ported/group-comparison.md` contains each group number, original

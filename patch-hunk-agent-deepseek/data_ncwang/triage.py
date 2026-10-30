@@ -3,7 +3,8 @@
 """逐 hunk 分诊：这个 hunk 到底要不要移植到目标版本。
 
 输入：patch + summaries.json（已算好的 kind/symbol/summary/enclosing）+ CVE 描述
-输出：triaged.json —— 每个 hunk 的 {port, category, reason}
+输出：triaged.json —— 每个 hunk 的移植决定与独立的闭包复核标记。
+review_required=True 只表示同名符号值得复核，不改变 port 决定。
 
 用法: triage.py <patch> <summaries.json> <cve_desc> <out.json> [model]
 """
@@ -18,6 +19,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "backport_patch/tools/patch-backporting/src"))
 from tools.utils import split_patch_indexed  # noqa: E402
 from tools.hunk_dependencies import (fingerprint, review_dependencies, syntax_prerequisites)  # noqa: E402
+
+LEGACY_SYMBOL_CLOSURE_SUFFIX = " | 符号闭包："
 
 TPL = """上游提交里混着三类内容：
   ① fix       —— 目标 CVE 的修复语义，必须移植
@@ -95,7 +98,15 @@ def postprocess(rows, hunks, summaries, repo, target_ref, reviews=None):
     """Close only evidenced prerequisites; summary names never select hunks."""
     by_id = {r["hunk"]: r for r in rows}
     for row in rows:
-        row.setdefault("initial_decision", {k: row.get(k) for k in ("port", "category", "reason")})
+        if not isinstance(row.get("initial_decision"), dict):
+            reason = row.get("reason") or ""
+            if row.get("port") is True and LEGACY_SYMBOL_CLOSURE_SUFFIX in reason:
+                row["initial_decision"] = {
+                    "port": False, "category": "unknown",
+                    "reason": reason.split(LEGACY_SYMBOL_CLOSURE_SUFFIX, 1)[0],
+                }
+            else:
+                row["initial_decision"] = {k: row.get(k) for k in ("port", "category", "reason")}
         row.update(row["initial_decision"])
         row.pop("func_in_target", None)
         row.pop("semantic_candidates", None)
@@ -103,6 +114,7 @@ def postprocess(rows, hunks, summaries, repo, target_ref, reviews=None):
         row.pop("dependency_fingerprint", None)
         row.pop("dependency_status", None)
         row["retained_by"] = []
+        row.update(review_required=False, closure_symbols=[], review_reason="")
     edges = syntax_prerequisites(summaries)
     if reviews is not None:
         edges += [{**edge, "consumer": consumer, "kind": "reviewed_prerequisite"}
@@ -134,6 +146,24 @@ def postprocess(rows, hunks, summaries, repo, target_ref, reviews=None):
                 pending.append(row["hunk"])
     for row in rows:
         row["needs_semantic_mapping"] = row.get("port") is True
+        row["triage_state"] = ("port_required" if row.get("port") is True else
+                               "not_required" if row.get("port") is False else "undecided")
+    # Same-name evidence is a review hint only. Actual retention remains governed
+    # by the scoped syntax/reviewed prerequisites above, with no closure-depth cap.
+    by_symbol = {}
+    for i, summary in enumerate(summaries):
+        symbol = summary.get("symbol")
+        if symbol and symbol not in {"?", "-"}:
+            by_symbol.setdefault(symbol, []).append(summary.get("hunk", i))
+    for symbol, ids in by_symbol.items():
+        if not any(by_id[h].get("port") is True for h in ids):
+            continue
+        for h in ids:
+            row = by_id[h]
+            if row.get("port") is False:
+                row.update(review_required=True, triage_state="review_only_closure",
+                           closure_symbols=sorted(set(row["closure_symbols"]) | {symbol}),
+                           review_reason="符号闭包复核：%s 同链另有必须移植的 hunk；本 hunk 不自动移植" % symbol)
     if reviews is not None:
         by_hunk = {h.get("idx", i): h for i, h in enumerate(hunks)}
         for summary in summaries:
@@ -238,10 +268,12 @@ def main():
     postprocess(rows, hunks, summaries, repo, target_ref, reviews)
 
     Path(out_path).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    n_port = sum(1 for x in rows if x.get("port"))
-    n_fail = sum(1 for x in rows if x.get("port") is None)
-    print("\n合计: port=%d, skip=%d, 失败=%d" % (
-        n_port, len(rows) - n_port - n_fail, n_fail))
+    n_port = sum(1 for x in rows if x.get("port") is True)
+    n_skip = sum(1 for x in rows if x.get("port") is False)
+    n_review = sum(1 for x in rows if x.get("port") is False and x.get("review_required"))
+    n_fail = sum(1 for x in rows if type(x.get("port")) is not bool)
+    print("\n合计: port=%d, skip=%d（仅复核 %d）, 失败=%d" % (
+        n_port, n_skip, n_review, n_fail))
 
 
 if __name__ == "__main__":

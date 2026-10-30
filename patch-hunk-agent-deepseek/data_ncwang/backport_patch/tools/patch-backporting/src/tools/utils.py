@@ -799,11 +799,12 @@ def hunk_coverage_report(member_hunks, produced_patch_text: str, need_not_ported
 
 
 def uncovered_hunks(hunks, groups_spec):
-    """分组规格没覆盖到的 hunk 下标列表（空 = 完整划分）。"""
+    """分组规格既未移植、也未显式排除的 hunk 下标列表。"""
     covered = set()
     if groups_spec:
         for g in groups_spec.get("groups", []):
             covered |= {int(i) for i in g.get("hunks", [])}
+        covered |= {int(i) for i in groups_spec.get("excluded_hunks", [])}
     return [h["idx"] for h in hunks if h["idx"] not in covered]
 
 
@@ -818,6 +819,8 @@ def group_patch(patch: str, groups_spec=None, flag_commit: bool = True):
         patch (str): 完整 patch 文本。
         groups_spec (dict | None): 分组规格；为 None 时退化成「每个 hunk 单独一组」，
                                    即原有的逐个 hunk 行为。
+                                   excluded_hunks 中的 hunk 已由 triage 判定无需移植，
+                                   不会在回退模式中重新生成 solo group。
         flag_commit (bool): patch 里是否带 commit message。
 
     Returns:
@@ -833,11 +836,18 @@ def group_patch(patch: str, groups_spec=None, flag_commit: bool = True):
     by_idx = {h["idx"]: h for h in hunks}
     assign = {}
     specs = []
+    excluded = set()
 
     if groups_spec:
+        excluded = {int(i) for i in groups_spec.get("excluded_hunks", [])}
         for g in groups_spec.get("groups", []):
             members = [int(i) for i in g.get("hunks", [])]
             members = [i for i in members if i in by_idx]
+            conflict = sorted(set(members) & excluded)
+            if conflict:
+                raise ValueError(
+                    "hunks cannot be both port-required and excluded: %s" % conflict
+                )
             if not members:
                 continue
             specs.append(
@@ -862,7 +872,8 @@ def group_patch(patch: str, groups_spec=None, flag_commit: bool = True):
             )
 
     # 没被分组覆盖到的 hunk：各自单独成组（保持原来的逐 hunk 行为）
-    uncovered = [h["idx"] for h in hunks if h["idx"] not in assign]
+    uncovered = [h["idx"] for h in hunks
+                 if h["idx"] not in assign and h["idx"] not in excluded]
     if uncovered and groups_spec:
         logger.warning(
             "分组规格没有覆盖全部 hunk！有 %d 个 hunk 不在任何组里，"
@@ -870,7 +881,7 @@ def group_patch(patch: str, groups_spec=None, flag_commit: bool = True):
             % (len(uncovered), uncovered)
         )
     for h in hunks:
-        if h["idx"] not in assign:
+        if h["idx"] not in assign and h["idx"] not in excluded:
             specs.append(
                 {
                     "gid": "solo-%d" % h["idx"],

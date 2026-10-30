@@ -16,6 +16,7 @@ sys.path.insert(0, str(SRC))
 from agent.coverage import CoverageReviewer, artifact_tree, read_blob, verify_review
 from agent.invoke_llm import evaluate_global_artifact
 from tools.project import Project, FinalValidationUnavailable
+from tools.utils import group_patch, split_patch_indexed, uncovered_hunks
 from git import Repo
 
 spec = importlib.util.spec_from_file_location('triage_coverage_test', ROOT / 'data_ncwang/triage.py')
@@ -66,6 +67,91 @@ class TriageRelevanceTests(unittest.TestCase):
         self.assertTrue(rows[0]['port'])
         self.assertTrue(rows[0]['needs_semantic_mapping'])
         self.assertIn('被 hunk 1 依赖', rows[0]['reason'])
+
+
+    def test_shared_symbol_requires_review_but_never_forces_a_skip_to_port(self):
+        rows = [
+            dict(hunk=0, port=True, category='fix', reason='production fix'),
+            dict(hunk=1, port=False, category='unrelated', reason='test-only adaptation'),
+        ]
+        hunks = [
+            {'text': '+clearApplicationUserData(caller, userId, restore);'},
+            {'text': '+clearApplicationUserData(caller, observer, userId, restore);'},
+        ]
+        summaries = [
+            dict(symbol='clearApplicationUserData', kind='logic'),
+            dict(symbol='clearApplicationUserData', kind='logic'),
+        ]
+        triage.postprocess(rows, hunks, summaries, '', 'base')
+        self.assertIs(rows[1]['port'], False)
+        self.assertEqual(rows[1]['category'], 'unrelated')
+        self.assertTrue(rows[1]['review_required'])
+        self.assertEqual(rows[1]['triage_state'], 'review_only_closure')
+        self.assertEqual(rows[1]['closure_symbols'], ['clearApplicationUserData'])
+        self.assertEqual(rows[1]['initial_decision']['port'], False)
+
+        snapshot = json.loads(json.dumps(rows, ensure_ascii=False))
+        triage.postprocess(rows, hunks, summaries, '', 'base')
+        self.assertEqual(rows, snapshot)
+
+    def test_postprocess_repairs_a_stale_name_wide_promotion(self):
+        rows = [
+            dict(hunk=0, port=True, category='fix', reason='production fix'),
+            dict(
+                hunk=1,
+                port=True,
+                category='fix',
+                reason='test-only adaptation | 符号闭包：clearApplicationUserData 这条 API 链必须整体移植',
+            ),
+        ]
+        hunks = [{'text': '+clearApplicationUserData(caller, restore);'},
+                 {'text': '+clearApplicationUserData(caller, observer, restore);'}]
+        summaries = [dict(symbol='clearApplicationUserData', kind='logic'),
+                     dict(symbol='clearApplicationUserData', kind='logic')]
+        triage.postprocess(rows, hunks, summaries, '', 'base')
+        self.assertIs(rows[1]['port'], False)
+        self.assertEqual(rows[1]['category'], 'unknown')
+        self.assertEqual(rows[1]['reason'], 'test-only adaptation')
+        self.assertTrue(rows[1]['review_required'])
+
+    def test_shared_symbol_does_not_turn_an_undecided_hunk_into_a_decision(self):
+        rows = [
+            dict(hunk=0, port=True, category='fix', reason='production fix'),
+            dict(hunk=1, port=None, category='unknown', reason='triage failed'),
+        ]
+        hunks = [{'text': '+useApi();'}, {'text': '+useApiWithExtraArg();'}]
+        summaries = [dict(symbol='useApi', kind='logic'),
+                     dict(symbol='useApi', kind='logic')]
+        triage.postprocess(rows, hunks, summaries, '', 'base')
+        self.assertIsNone(rows[1]['port'])
+        self.assertFalse(rows[1]['review_required'])
+        self.assertEqual(rows[1]['triage_state'], 'undecided')
+
+    def test_dependency_closure_does_not_turn_an_undecided_hunk_into_a_port(self):
+        rows = [
+            dict(hunk=0, port=None, category='unknown', reason='triage failed'),
+            dict(hunk=1, port=True, category='fix', reason='production fix'),
+        ]
+        hunks = [{'text': '+void requiredHelper() {}'}, {'text': '+requiredHelper();'}]
+        summaries = [dict(symbol='requiredHelper', kind='declare'),
+                     dict(symbol='caller', kind='logic')]
+        triage.postprocess(rows, hunks, summaries, '', 'base')
+        self.assertIsNone(rows[0]['port'])
+        self.assertFalse(rows[0]['needs_semantic_mapping'])
+        self.assertEqual(rows[0]['triage_state'], 'undecided')
+
+    def test_triage_excluded_hunk_is_not_reinserted_by_group_fallback(self):
+        patch = (
+            'diff --git a/A.java b/A.java\n--- a/A.java\n+++ b/A.java\n'
+            '@@ -1 +1 @@\n-oldA\n+newA\n'
+            'diff --git a/B.java b/B.java\n--- a/B.java\n+++ b/B.java\n'
+            '@@ -1 +1 @@\n-oldB\n+newB\n'
+        )
+        _, hunks = split_patch_indexed(patch, True)
+        spec = {'groups': [{'hunks': [0]}], 'excluded_hunks': [1]}
+        self.assertEqual(uncovered_hunks(hunks, spec), [])
+        _, merged = group_patch(patch, spec, True)
+        self.assertEqual([group['hunks'] for group in merged], [[0]])
 
 
 class SplitReviewJudgeTests(unittest.TestCase):
