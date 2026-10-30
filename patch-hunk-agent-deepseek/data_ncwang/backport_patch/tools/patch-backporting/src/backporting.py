@@ -4,6 +4,7 @@ import glob
 import logging
 import os
 import shutil
+import sys
 import time
 from types import SimpleNamespace
 
@@ -352,8 +353,10 @@ def main():
             llm, project, debug_mode, group_mode=True, max_iterations=budget
         )
 
+    exit_code = 2
     try:
         do_backport(agent_executor, project, data, llm, logfile, make_agent=make_agent)
+        exit_code = 0 if project.poc_succeeded else 2
         end_time = time.time()
         time.sleep(10)
         
@@ -361,6 +364,7 @@ def main():
             f"This patch total cost time: {int(end_time - start_time)} Seconds."
         )
     except KeyboardInterrupt:
+        exit_code = 130
         logger.debug("Start to calculate cost!")
         end_time = time.time()
 
@@ -369,10 +373,11 @@ def main():
         )
 
     shutil.copy(logfile, data.patch_dataset_dir)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 
 #                    Version A           Version A(Fixed)
 #   ┌───┐            ┌───┐             ┌───┐

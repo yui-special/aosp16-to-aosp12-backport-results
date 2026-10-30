@@ -2,9 +2,11 @@
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
-from pathlib import PurePosixPath
+import uuid
+from pathlib import Path, PurePosixPath
 
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -161,6 +163,45 @@ def _format_review_as_json(llm, raw_result, members, evidence_registry):
     return _extract_json_object(normalized_text), normalized_text, finish_reason
 
 
+def _verify_formatted_decisions(payload, original):
+    """Only normalize explicit per-hunk verdicts; ambiguous prose needs a new judge reply."""
+    headings = list(re.finditer(r'(?im)^[ \t]*(?:[-*] +)?Hunk\s+#?(\d+)\b', original))
+    explicit = {}
+    aliases = {'pass': 'satisfied', 'fail': 'missing', 'incomplete': 'missing',
+               'not applicable': 'not_applicable'}
+    for i, heading in enumerate(headings):
+        block = original[heading.start():headings[i + 1].start() if i + 1 < len(headings) else len(original)].strip()
+        verdict = re.match(r'(?i)(?:[-*] +)?Hunk\s+#?\d+\s*(?:is\s+|:\s*|[-–—]\s*)'
+                           r'(not_applicable|not applicable|satisfied|missing|incomplete|pass|fail)'
+                           r'(?=\s*(?:[.:\n]|because\b|by\b|$))', block)
+        idx = int(heading[1])
+        if verdict is None or idx in explicit:
+            raise ValueError('Formatter cannot establish a unique original verdict for hunk %d' % idx)
+        status = verdict[1].lower()
+        explicit[idx] = (aliases.get(status, status), block)
+    rows = payload.get('members') if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError('Formatter must return members')
+    for row in rows:
+        expected = explicit.get(row.get('idx'))
+        if expected is None or row.get('status') != expected[0]:
+            raise ValueError('Formatter changed or invented an original hunk verdict')
+        block = expected[1]
+        for item in row.get('evidence', []):
+            evidence_id = item.get('evidence_id')
+            if not isinstance(evidence_id, str) or not re.search(
+                    r'(?<!\w)' + re.escape(evidence_id) + r'(?!\w)', block):
+                raise ValueError('Formatter added evidence absent from the original hunk verdict')
+        # Keep the judge's explanation verbatim, never a formatter-authored replacement.
+        row['reason'] = block
+    return payload
+
+
+def _redact(text):
+    text = re.sub(r'\bsk-[A-Za-z0-9_-]+', '[REDACTED_KEY]', text)
+    return re.sub(r'(?i)(bearer\s+)\S+', r'\1[REDACTED]', text)
+
+
 def _evidence_trace(run):
     """Keep tool calls and observations available to the tool-free final judge."""
     trace = []
@@ -220,10 +261,22 @@ def verify_review(payload, members, read_candidate, evidence_registry=None):
 
 
 class CoverageReviewer:
-    def __init__(self, llm, repo, base, *, max_iterations=20, retries=1):
+    def __init__(self, llm, repo, base, *, max_iterations=20, retries=1, artifact_dir=None):
         self.llm, self.repo, self.base = llm, str(repo), base
         self.max_iterations, self.retries = max_iterations, retries
         self.cache = {}
+        self.artifact_dir = Path(artifact_dir) if artifact_dir else None
+
+    def save_attempt(self, record):
+        if self.artifact_dir is None:
+            return
+        try:
+            self.artifact_dir.mkdir(parents=True, exist_ok=True)
+            text = _redact(json.dumps(record, ensure_ascii=False, indent=2, default=str))
+            path = self.artifact_dir / (record['candidate_tree'][:12] + '-' + uuid.uuid4().hex + '.json')
+            path.write_text(text + '\n', encoding='utf-8')
+        except OSError as exc:
+            logger.warning('Cannot save semantic review response: %s', exc)
 
     def review(self, members, patch):
         digest = hashlib.sha256(patch.encode('utf-8', 'surrogateescape')).hexdigest()
@@ -292,16 +345,28 @@ class CoverageReviewer:
         tools = [read_target, find_target]
         agent = create_tool_calling_agent(self.llm, tools, prompt)
         executor = AgentExecutor(agent=agent, tools=tools, verbose=False,
-                                 max_iterations=self.max_iterations)
+                                 max_iterations=self.max_iterations, return_intermediate_steps=True)
         request = json.dumps({'upstream_hunks': members, 'complete_candidate_patch': patch,
                               'candidate_tree': tree, 'original_base': self.base}, ensure_ascii=False)
         errors = []
         logger.info('Reviewing final candidate %s against %d upstream hunks', tree[:12], len(members))
-        try:
-            evidence_run = executor.invoke({'request': request}, return_intermediate_steps=True)
-        except Exception as exc:  # noqa: BLE001
-            errors.append('evidence_collection: ' + type(exc).__name__ + ': ' + str(exc))
-            logger.warning('Final semantic evidence collection failed: %s', errors[-1])
+        evidence_run = None
+        for attempt in range(self.retries + 1):
+            record = dict(candidate_tree=tree, patch_sha256=digest, stage='evidence_collection',
+                          attempt=attempt + 1, max_iterations=self.max_iterations)
+            try:
+                evidence_run = executor.invoke({'request': request})
+                record.update(status='complete', output=evidence_run.get('output', ''),
+                              tool_steps=len(evidence_run.get('intermediate_steps') or []),
+                              tool_trace=_evidence_trace(evidence_run), evidence_registry=dict(evidence_registry))
+                break
+            except Exception as exc:  # noqa: BLE001
+                errors.append('evidence_collection: ' + type(exc).__name__ + ': ' + str(exc))
+                record.update(status='unavailable', error=errors[-1])
+                logger.warning('Final semantic evidence collection failed: %s', _redact(errors[-1]))
+            finally:
+                self.save_attempt(record)
+        if evidence_run is None:
             return dict(complete=False, missing=[h['idx'] for h in members], candidate_tree=tree,
                         patch_sha256=digest, method='semantic_review_failed',
                         error=errors[-1], errors=errors, review_stage='evidence_collection',
@@ -320,6 +385,9 @@ class CoverageReviewer:
         error = ''
         for attempt in range(self.retries + 1):
             response, raw_result = None, ''
+            record = dict(candidate_tree=tree, patch_sha256=digest, stage='final_json',
+                          attempt=attempt + 1, output=None,
+                          tool_steps=len(evidence_run.get('intermediate_steps') or []))
             try:
                 request_payload = dict(judge_payload)
                 if error:
@@ -329,12 +397,15 @@ class CoverageReviewer:
                     HumanMessage(content=json.dumps(request_payload, ensure_ascii=False, default=str)),
                 ])
                 raw_result = _message_text(response).strip()
+                record['output'] = raw_result
+                record['response_metadata'] = getattr(response, 'response_metadata', {}) or {}
                 normalization = {
                     'method': 'direct_json_or_wrapper',
                     'initial_parse_error': None,
                     'normalized_text': None,
                     'formatter_finish_reason': None,
                 }
+                record['normalization'] = normalization
                 try:
                     payload = _extract_json_object(raw_result)
                 except ValueError as parse_error:
@@ -350,6 +421,7 @@ class CoverageReviewer:
                         normalized_text=normalized_text,
                         formatter_finish_reason=formatter_finish_reason,
                     )
+                    payload = _verify_formatted_decisions(payload, raw_result)
                 verified = verify_review(payload, members, candidate, evidence_registry)
                 verified.update(
                     candidate_tree=tree,
@@ -357,17 +429,21 @@ class CoverageReviewer:
                     review_json_normalization=normalization,
                 )
                 self.cache[key] = verified
+                record.update(status='complete', missing=verified['missing'])
                 logger.info('Final semantic review complete: missing hunks %s', verified['missing'])
                 return dict(verified, patch_sha256=digest)
             except Exception as exc:
                 metadata = getattr(response, 'response_metadata', {}) or {}
                 finish_reason = metadata.get('finish_reason') or metadata.get('stop_reason')
                 errors.append('final_json: ' + type(exc).__name__ + ': ' + str(exc))
-                logger.warning('Final semantic review attempt %d failed: %s', attempt + 1, errors[-1])
+                record.update(status='unavailable', error=errors[-1])
+                logger.warning('Final semantic review attempt %d failed: %s', attempt + 1, _redact(errors[-1]))
                 logger.warning('Final review raw output (finish_reason=%s): %r',
-                               finish_reason, raw_result[:4000])
+                               finish_reason, _redact(raw_result[:4000]))
                 error = ('Previous review invalid: %s. Return only the required JSON object; '
                          'use only supplied evidence IDs and do not omit any hunk.' % exc)
+            finally:
+                self.save_attempt(record)
         return dict(complete=False, missing=[h['idx'] for h in members], candidate_tree=tree,
                     patch_sha256=digest, method='semantic_review_failed', error=error, errors=errors,
                     review_stage='final_json',

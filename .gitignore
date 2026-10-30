@@ -4,3 +4,5 @@
 node_modules/
 /patch-hunk-agent/**/__pycache__/
 /patch-hunk-agent/**/*.py[cod]
+/patch-hunk-agent-deepseek/**/__pycache__/
+/patch-hunk-agent-deepseek/**/*.py[cod]

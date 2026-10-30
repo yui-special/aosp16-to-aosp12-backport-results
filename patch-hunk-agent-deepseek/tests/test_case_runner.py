@@ -15,6 +15,12 @@ RUNNER = (Path(__file__).resolve().parents[1]
 
 class CaseRunnerTests(unittest.TestCase):
     def test_configured_stage_paths_with_spaces_and_generation_exit_status(self):
+        self.run_pipeline()
+
+    def test_configured_models_survive_and_postcheck_failure_is_propagated(self):
+        self.run_pipeline(configured=True, generation_rc=0, chain_rc=1)
+
+    def run_pipeline(self, configured=False, generation_rc=23, chain_rc=0):
         with tempfile.TemporaryDirectory(prefix='configured pipeline ') as directory:
             base = Path(directory)
             root, scripts, dataset, case, out, repo, bin_dir = [base / name for name in
@@ -27,8 +33,13 @@ class CaseRunnerTests(unittest.TestCase):
                 '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '-qm', 'fixture'], check=True)
             (dataset / 'real.patch').write_text('fixture patch\n')
             config = base / 'input config.yml'
-            config.write_text(yaml.safe_dump({'project_dir': str(repo), 'target_release': 'HEAD',
-                'new_patch': 'fixture', 'patch_dataset_dir': str(dataset), 'openai_key': 'test-placeholder'}))
+            settings = {'project_dir': str(repo), 'target_release': 'HEAD',
+                'new_patch': 'fixture', 'patch_dataset_dir': str(dataset), 'openai_key': 'test-placeholder'}
+            if configured:
+                settings.update(llm_model='generation-fixture', coverage_model='review-fixture',
+                                summary_model='summary-fixture', triage_model='triage-fixture',
+                                map_model='mapping-fixture', llm_base_url='http://127.0.0.1:9/custom')
+            config.write_text(yaml.safe_dump(settings))
             curl = bin_dir / 'curl'
             curl.write_text('#!/usr/bin/env sh\nprintf 200\n')
             curl.chmod(0o755)
@@ -54,7 +65,8 @@ elif name=='backporting.py':
  config=yaml.safe_load(Path(args[1]).read_text())
  assert Path(config['merged_hunks_dir']).is_dir()
  (Path(config['patch_dataset_dir'])/'complete.patch').write_text('partial artifact\\n')
- raise SystemExit(23)
+ raise SystemExit(int(os.environ['GENERATION_FIXTURE_RC']))
+elif name=='chain_check.py': raise SystemExit(int(os.environ['CHAIN_FIXTURE_RC']))
 '''
             for path in [base / 'summarize_and_group.py', base / 'triage.py',
                          base / 'chain_check.py', base / 'make_verdict.py',
@@ -66,12 +78,17 @@ elif name=='backporting.py':
                    'BACKPORT_SCRIPTS': str(scripts), 'BACKPORT_DATASET': str(dataset),
                    'BACKPORT_CONFIG': str(config), 'BACKPORT_CASE': str(case), 'OUT': str(out),
                    'ENABLE_TRIAGE': '1', 'STOP_AFTER_EXPORT': '0', 'STAGE_AUDIT': str(audit),
-                   'DEEPSEEK_API_KEY': 'test-placeholder',
+                   'GENERATION_FIXTURE_RC': str(generation_rc), 'CHAIN_FIXTURE_RC': str(chain_rc),
                    'LLM_BASE_URL': 'http://127.0.0.1:9', 'LLM_ENDPOINT': 'http://127.0.0.1:9/models',
                    'PATH': str(bin_dir) + os.pathsep + os.environ['PATH']}
+            for key in ('DEEPSEEK_MODEL', 'LLM_MODEL', 'COVERAGE_MODEL', 'SUMMARY_MODEL', 'GROUP_MODEL',
+                        'TRIAGE_MODEL', 'MAP_MODEL', 'DEEPSEEK_API_KEY', 'LLM_KEY', 'CHAIN_CHECK_SCRIPT'):
+                env.pop(key, None)
+            if configured:
+                env.pop('LLM_BASE_URL')
             result = subprocess.run(['bash', str(RUNNER), 'configured-project', 'configured-case'],
                                     env=env, capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+            self.assertEqual(result.returncode, generation_rc or chain_rc, result.stdout + result.stderr)
             self.assertEqual((out / 'complete.patch').read_text(), 'partial artifact\n')
             self.assertFalse((out / 'config.used.yml').exists())
             stages = [json.loads(line)[0] for line in audit.read_text().splitlines()]
@@ -86,14 +103,19 @@ elif name=='backporting.py':
             triage_call = next(args for name, args in calls if name == 'triage.py')
             mapping_call = next(args for name, args in calls
                                 if name == 'map_semantics.py')
-            self.assertEqual(summary_call[2], 'deepseek-flash')
-            self.assertEqual(triage_call[4], 'deepseek-flash')
-            self.assertEqual(mapping_call[7], 'deepseek-flash')
+            self.assertEqual(summary_call[2], settings.get('summary_model', 'deepseek-flash'))
+            self.assertEqual(triage_call[4], settings.get('triage_model', 'deepseek-flash'))
+            self.assertEqual(mapping_call[7], settings.get('map_model', 'deepseek-flash'))
             used_config = yaml.safe_load((case / 'config.yml').read_text())
-            self.assertEqual(used_config['llm_model'], 'deepseek-flash')
-            self.assertEqual(used_config['coverage_model'], 'deepseek-flash')
+            self.assertEqual(used_config['llm_model'], settings.get('llm_model', 'deepseek-flash'))
+            self.assertEqual(used_config['coverage_model'], settings.get('coverage_model', 'deepseek-flash'))
+            self.assertEqual(used_config['llm_base_url'], settings.get('llm_base_url', env['LLM_ENDPOINT'].removesuffix('/models')))
             self.assertFalse(used_config['use_azure'])
             self.assertNotIn('openai_key', used_config)
+            chain_args = next(args for name, args in calls if name == 'chain_check.py')
+            target = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+            self.assertEqual(chain_args[-2:], ['--base', target])
+            self.assertEqual(used_config['target_release'], target)
 
 
 if __name__ == '__main__':

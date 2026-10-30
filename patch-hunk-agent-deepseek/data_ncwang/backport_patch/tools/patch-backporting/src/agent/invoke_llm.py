@@ -24,7 +24,7 @@ from agent.prompt import (
 )
 from tools.logger import logger
 from tools.group_report import GroupComparison
-from tools.project import Project
+from tools.project import Project, FinalValidationUnavailable
 from agent.coverage import CoverageReviewer
 from tools.utils import (
     dump_merged_hunks,
@@ -212,12 +212,12 @@ def evaluate_global_artifact(
         accepted_need_not_ported = {m['idx'] for m in global_cov['members']
                                    if m.get('status') == 'not_applicable' and m['covered']}
 
-    chain_script = os.environ.get("CHAIN_CHECK_SCRIPT", "/data/ncwang/chain_check.py")
+    chain_script = os.environ.get("CHAIN_CHECK_SCRIPT") or os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '../../../../../chain_check.py'))
     chain_path = os.path.join(ported_dir, "global-api-chain.txt")
-    if cumulative:
+    if cumulative and global_cov.get('candidate_tree'):
         chain_env = os.environ.copy()
-        if global_cov.get('candidate_tree'):
-            chain_env['CHAIN_CHECK_REF'] = global_cov['candidate_tree']
+        chain_env['CHAIN_CHECK_REF'] = global_cov['candidate_tree']
         chain_proc = subprocess.run(
             [sys.executable, chain_script, project.dir, complete_path],
             capture_output=True,
@@ -228,8 +228,8 @@ def evaluate_global_artifact(
         chain_rc = chain_proc.returncode
         chain_report = (chain_proc.stdout or "") + (chain_proc.stderr or "")
     else:
-        chain_rc = 1
-        chain_report = "API chain check requires cumulative mode.\n"
+        chain_rc = 2
+        chain_report = "API chain check requires a fixed candidate tree in cumulative mode; no working-tree fallback.\n"
     with open(chain_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(chain_report)
 
@@ -790,8 +790,8 @@ def do_backport(
         logger.warning("写完整 patch 失败: %s" % e)
 
     # ---- Global validation over the FINAL composed patch --------------------
-    # This runs once before final repair and again after the validated artifact
-    # is rebuilt, so stale pre-repair statuses cannot report a false success.
+    # Review each candidate after its build/test attempt, and again after the
+    # validated artifact is rebuilt. Review outages must not skip compilation.
     validation_base = project.repo.git.rev_parse(cum_base or data.target_release)
     review_llm = llm
     if getattr(data, 'coverage_model', None) and data.coverage_model != getattr(data, 'llm_model', None):
@@ -801,10 +801,11 @@ def do_backport(
     project.coverage_reviewer = CoverageReviewer(
         review_llm, project.dir, validation_base,
         max_iterations=getattr(data, 'coverage_review_iterations', 20),
-        retries=getattr(data, 'coverage_review_retries', 1))
+        retries=getattr(data, 'coverage_review_retries', 1),
+        artifact_dir=os.path.join(ported_dir, 'coverage-review'))
 
     def final_artifact_check(candidate):
-        # The same check protects every full-patch repair before compilation.
+        # The same check protects acceptance of every compiled repair candidate.
         with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', encoding='utf-8',
                                          errors='surrogateescape') as artifact:
             artifact.write(candidate if candidate.endswith('\n') else candidate + '\n')
@@ -812,8 +813,19 @@ def do_backport(
             complete, report = evaluate_global_artifact(
                 project, candidate, artifact.name, ported_dir, hunks_by_idx,
                 selected_hunks, accepted_need_not_ported, any_strict_requires_patch, cumulative)
-        if report['coverage']['method'] == 'semantic_review_failed':
-            raise RuntimeError('FINAL_REVIEW_UNAVAILABLE: ' + str(report['coverage'].get('error')))
+        review_failed = report['coverage']['method'] == 'semantic_review_failed'
+        chain_failed = report['api_chain_rc'] not in (0, 1)
+        if review_failed or chain_failed:
+            unavailable, findings = [], []
+            if review_failed:
+                unavailable.append('Semantic review: ' + str(report['coverage'].get('error')))
+            elif not report['coverage']['complete']:
+                findings.append('SEMANTIC_VALIDATION_FAILED: ' + json.dumps(report['coverage'], ensure_ascii=False))
+            if chain_failed:
+                unavailable.append('API check could not run: ' + report['api_chain_report'])
+            elif report['api_chain_rc'] == 1:
+                findings.append('API_CHAIN_VALIDATION_FAILED:\n' + report['api_chain_report'])
+            raise FinalValidationUnavailable('\n'.join(unavailable), '\n'.join(findings))
         if complete:
             return ''
         return 'SEMANTIC_VALIDATION_FAILED: ' + json.dumps({
@@ -823,22 +835,10 @@ def do_backport(
             'api_chain': report['api_chain_report'],
         }, ensure_ascii=False)
 
-    all_groups_complete, global_result = evaluate_global_artifact(
-        project, complete_patch, complete_path, ported_dir, hunks_by_idx,
-        selected_hunks, accepted_need_not_ported, any_strict_requires_patch,
-        cumulative,
-    )
-
-    if global_result['coverage']['method'] == 'semantic_review_failed':
-        logger.error('Backport INCOMPLETE: final review could not finish. Candidate retained; '
-                     'review/API errors are not evidence that code must be rewritten.')
-        return
-
     if not complete_patch.strip():
         logger.error('Backport INCOMPLETE: no nonempty candidate to validate or repair.')
         return
-    # Full-patch mode is distinct from semantic acceptance. The callback rejects
-    # missing obligations before any build, including candidates from final repair.
+    # Full-patch mode runs build/test before checking semantic acceptance.
     project.all_hunks_applied_succeeded = True
     project.final_artifact_check = final_artifact_check
 
@@ -855,6 +855,10 @@ def do_backport(
     project.context_mismatch_times = 0
     project.full_patch_base = validation_base
     validate_ret = project._validate(validation_base, complete_patch)
+    if project.final_validation_unavailable and not project.final_repair_required:
+        logger.error('Backport INCOMPLETE: build/test passed, but final validation is unavailable. '
+                     'Candidate retained; no concrete code defect was found to send for repair.')
+        return
     if project.poc_succeeded:
         project.persist_validated_patch(complete_patch, validation_base)
         write_patch_atomic(complete_path, complete_patch)
@@ -917,7 +921,8 @@ def do_backport(
             project.checkpoint_dir, "latest-validated.patch"
         )
         if os.path.isfile(latest_checkpoint):
-            checkpoint_text = open(latest_checkpoint, encoding="utf-8").read()
+            with open(latest_checkpoint, encoding="utf-8") as checkpoint_file:
+                checkpoint_text = checkpoint_file.read()
             if checkpoint_text and checkpoint_text not in candidates:
                 candidates.append(checkpoint_text)
 

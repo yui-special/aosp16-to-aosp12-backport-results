@@ -104,7 +104,7 @@ class GroupComparisonTests(unittest.TestCase):
         with patch.object(runtime, "logger", self.logger), \
                 patch.object(runtime, "group_patch", return_value=("", groups)), \
                 patch.object(runtime, "split_patch_indexed", return_value=("", hunks)), \
-                patch.object(runtime, "evaluate_global_artifact", side_effect=StopIteration('report boundary')):
+                patch.object(runtime, "CoverageReviewer", side_effect=StopIteration('report boundary')):
             with self.assertRaises(StopIteration):
                 runtime.do_backport(executor, project, data, None,
                                     str(self.directory / "runtime.log"))
@@ -156,7 +156,7 @@ class GroupComparisonTests(unittest.TestCase):
         with patch.object(runtime, "logger", self.logger), \
                 patch.object(runtime, "group_patch", return_value=("", [original])), \
                 patch.object(runtime, "split_patch_indexed", return_value=("", hunks)), \
-                patch.object(runtime, "evaluate_global_artifact", side_effect=StopIteration('report boundary')), \
+                patch.object(runtime, "CoverageReviewer", side_effect=StopIteration('report boundary')), \
                 patch.dict("os.environ", {"PG_COMPILE_PER_GROUP": "0"}):
             with self.assertRaises(StopIteration):
                 runtime.do_backport(SimpleNamespace(invoke=invoke), project, data, None,

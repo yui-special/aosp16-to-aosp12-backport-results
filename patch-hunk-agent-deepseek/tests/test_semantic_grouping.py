@@ -65,6 +65,35 @@ class SemanticGroupingTests(unittest.TestCase):
         self.assertNotIn('"candidate_edges":', ask.call_args.args[0])
         self.assertEqual(ask.call_count, 1)
 
+    def test_prefilter_dependency_review_is_reused_as_order_not_forced_merge(self):
+        summaries = [{'hunk': h, 'source_structure': {}, 'dependency_review': {
+            'reason': 'Reviewed before filtering', 'requires': [] if h != 2 else [
+                {'provider': 0, 'reason': 'Concrete behavior required by assertion'}]}}
+            for h in range(3)]
+        hunks = [{'idx': h, 'text': '+change'} for h in range(3)]
+        ask = Mock(side_effect=AssertionError('must not guess dependencies a second time'))
+        plan = self.module.semantic_groups(summaries, hunks, [], [], ask)
+        self.assertEqual([g['hunks'] for g in plan], [[0], [1], [2]])
+        self.assertEqual(plan[2]['depends_on'], [0])
+        ask.assert_not_called()
+
+    def test_import_setup_is_bound_only_to_an_evidenced_consumer(self):
+        from tools.source_structure import Source
+        source = Source('A.java', b'''import pkg.Validator;
+class A {
+ void first() { unrelated(); }
+ void second() { Validator.check(); }
+}''')
+        lines = [1, 3, 4]
+        summaries = [{'hunk': h, 'file': 'A.java', 'source_structure': {
+            'before': {'scopes': []}, 'after': source.evidence([line], line, 1)},
+            'dependency_review': {'requires': []}} for h, line in enumerate(lines)]
+        hunks = [{'idx': h, 'text': '+'+source.data.decode().splitlines()[line-1]}
+                 for h, line in enumerate(lines)]
+        plan = self.module.semantic_groups(summaries, hunks, [], [], Mock())
+        self.assertIn([0, 2], [g['hunks'] for g in plan])
+        self.assertIn([1], [g['hunks'] for g in plan])
+
     def test_missing_duplicate_unknown_and_forward_dependency_are_rejected(self):
         invalid = [
             {'groups': [entry([0])]},

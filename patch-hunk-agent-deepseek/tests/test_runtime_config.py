@@ -1,9 +1,10 @@
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SRC = (Path(__file__).resolve().parents[1] / 'data_ncwang/backport_patch/tools/'
        'patch-backporting/src')
@@ -11,6 +12,24 @@ sys.path.insert(0, str(SRC))
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_generation_exit_status_requires_final_acceptance(self):
+        runtime = importlib.import_module('backporting')
+        for accepted, expected in [(False, 2), (True, 0)]:
+            with self.subTest(accepted=accepted), tempfile.TemporaryDirectory() as directory:
+                data = SimpleNamespace(project='fixture', tag='case', cumulative=False,
+                                       patch_dataset_dir=directory)
+                project = Mock(poc_succeeded=accepted)
+                with patch.object(sys, 'argv', ['backporting.py', '-c', 'fixture.yml']), \
+                        patch.object(runtime, 'load_yml', return_value=data), \
+                        patch.object(runtime, 'Project', return_value=project), \
+                        patch.object(runtime, 'initial_agent', return_value=(Mock(), Mock())), \
+                        patch.object(runtime, 'do_backport'), \
+                        patch.object(runtime, 'add_file_handler'), \
+                        patch.object(runtime.os, 'makedirs'), \
+                        patch.object(runtime.shutil, 'copy'), \
+                        patch.object(runtime.time, 'sleep'):
+                    self.assertEqual(runtime.main(), expected)
+
     def test_generation_model_and_endpoint_come_from_config(self):
         import yaml
         runtime = importlib.import_module('backporting')

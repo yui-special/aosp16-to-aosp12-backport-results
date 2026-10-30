@@ -1,8 +1,9 @@
 # AOSP16 -> AOSP12 Backport Agent
 
-This directory contains the grouped backport agent used for round24 on
-2026-10-28. It originated from the 2026-10-21 server snapshot under `/data/ncwang`;
-the existing `data_ncwang/` source layout is preserved.
+This directory is the maintained DeepSeek agent, based on commit `6779661` with
+the local dependency, validation and final-repair improvements integrated.
+Continue development here through incremental commits. The existing
+`data_ncwang/` layout and the historical `../patch-hunk-agent/` snapshot are preserved.
 
 The round24 runtime uses external launchers and configuration under `/data/lyh/aosp`.
 Results are archived in `../round24-results-20261028/`. Build/test scripts, credentials,
@@ -37,9 +38,13 @@ environments, backups and secrets are intentionally excluded.
 1. `v6_group.py --detect-only` detects source languages.
 2. `summarize_and_group.py` produces a per-hunk semantic contract.
 3. `v6_group.py --enclosing-only` extracts before/after source structure;
-   `triage.py`, when enabled, marks each hunk as port/skip.
+   `triage.py`, when enabled, makes initial port/skip decisions, then reviews
+   prerequisites over the complete patch before filtering. Required support
+   hunks are retained with their evidence in `triaged.json`.
 4. `v6_group.py` asks the grouping model for minimal cohesive semantic groups,
-   then checks unique hunk coverage and prerequisite ordering.
+   then checks unique hunk coverage and prerequisite ordering. It reuses the
+   triage dependency review; legacy/no-triage inputs still run dependency review
+   during grouping.
 5. `map_semantics.py` searches the target tree using contract terms, generic
    rename variants and surrounding code evidence, then maps each hunk to
    concrete existing target locations.
@@ -50,6 +55,15 @@ environments, backups and secrets are intentionally excluded.
    checks coverage, and accumulates successful groups.
 8. `chain_check.py` checks changed call signatures and `make_verdict.py`
    produces the final case verdict.
+
+Dependency closure does not use summary symbol names. Tree-sitter proves scoped
+parameter dependencies and unambiguous Java type-import uses; shadowed names,
+wildcard/static imports and unsupported syntax require semantic review. Changed
+statements include unchanged receivers and assertion context. The model reviews
+all original hunks and supplies quotes from both sides of each dependency.
+Quotes and hunk coverage are validated, but this is not a proof of semantic
+equivalence. Reviewed dependencies are tied to the patch and source revisions;
+they impose ordering without automatically merging an entire API chain.
 
 ## Per-group comparison
 
@@ -140,18 +154,29 @@ and reconstruction never falls back to applying a candidate on the cumulative br
    "need not ported" without concrete target-code evidence.
 6. **Final-patch global validation: implemented.** After all group sessions,
    every selected hunk is reviewed against the final composed patch, including
-   no-change claims. A separate model review classifies each obligation as
-   satisfied, inapplicable, or missing, citing exact candidate source lines.
+   no-change claims. A tool-using collector gathers candidate-code evidence;
+   a separate tool-free judge classifies each obligation as satisfied,
+   inapplicable, or missing. The judge receives the evidence registry and tool trace.
+   JSON wrappers are parsed directly. Prose formatting may only preserve explicit
+   per-hunk verdicts and evidence IDs; ambiguous decisions require another judge
+   response. Original explanations are retained rather than rewritten by the formatter.
    Citations are checked against an immutable Git tree built with a private
    index, without changing the working tree. Identifier overlap remains a
    diagnostic and cannot grant acceptance. Earlier groups may satisfy later
    obligations; upstream names do not have to survive an equivalent backport.
-   Missing obligations enter whole-patch repair. Each repaired candidate must
-   pass this review before real compilation/testing; evidence from another
-   candidate tree is never reused. The same tree runs `chain_check.py`; results are
+   Each complete candidate is compiled and tested before semantic acceptance.
+   Review outages retain the candidate and do not suppress build/test or repair
+   of concrete compilation, test, API-chain or semantic findings. An unavailable
+   review alone cannot justify rewriting code or accepting the patch. Review
+   responses, tool traces, normalization attempts and errors are saved by stage
+   under `coverage-review/`, bound to the candidate tree and patch hash, with keys redacted.
+   Evidence from another candidate tree is never reused. The same tree runs `chain_check.py`; results are
    written to `global-validation.json` and per-group status files receive
    `global_covered`, `global_api_chain_ok` and `global_validation_complete`.
-   A case cannot be `OK` if this global gate fails.
+   A case cannot be `OK` if this global gate fails; the generation process returns
+   non-zero when final validation is incomplete. The post-run chain check also
+   reconstructs the candidate from the original target commit and final patch,
+   independently of the current checkout, and propagates failures to the runner.
 
 Triage preserves the relevance decision separately from target mapping.
 Generic target terms such as JUnit annotations cannot promote unrelated changes,
@@ -179,10 +204,21 @@ Relevant optional environment variables:
   (default `https://api.deepseek.com/v1`).
 - `DEEPSEEK_MODEL`: default model for every LLM stage
   (default `deepseek-flash`).
+- `LLM_MODEL`, `COVERAGE_MODEL`: generation and final-review model overrides.
 - `SUMMARY_MODEL`, `TRIAGE_MODEL`, `MAP_MODEL`: per-stage model overrides.
-- `SUMMARY_MAX_FAILURES`: accepted summary failure count (default is 10%,
-  minimum 2); triage independently rejects any failed upstream summary.
+- `SUMMARY_MAX_FAILURES`: accepted upstream summary failure count (default 0),
+  enforced by both summary and triage stages.
 - `ENABLE_TRIAGE=1`: enable the optional semantic triage stage.
+- `TRIAGE_REQUEST_OPTIONS`: JSON request parameters (default `{"temperature":0}`).
+- `TRIAGE_READ_TIMEOUT`: per-hunk response read timeout in seconds (default 60).
+- `TRIAGE_DEPENDENCY_READ_TIMEOUT`: complete-patch dependency review timeout;
+  defaults to `GROUP_READ_TIMEOUT`, or 300 seconds if unset.
+- `TRIAGE_DEPENDENCY_REQUEST_OPTIONS`: complete-patch request options; defaults
+  to `TRIAGE_REQUEST_OPTIONS`.
+- `TRIAGE_DEPENDENCY_RETRIES`: retries for an invalid dependency review (default 1).
+  Unresolved per-hunk decisions and invalid reviews stop the stage; failures are
+  never treated as skips. `TRIAGE_POST_ONLY=1` replays saved decisions and existing
+  dependency reviews without model calls; it does not create a missing review.
 - `SEMANTIC_MAP_OFFLINE=1`: run only candidate discovery for testing. Normal
   runs require an online semantic mapping and abort on API failure.
 - `STOP_AFTER_EXPORT=1`: stop after the PortGPT input has been generated; used
@@ -190,7 +226,8 @@ Relevant optional environment variables:
 - `GROUP_MODEL`: semantic grouping model; defaults to `SUMMARY_MODEL`.
 - `GROUP_RETRIES`: retries per invalid grouping subtask (default 1).
 - `GROUP_ANALYSIS_WORKERS`: concurrent signature/local-scope reviews (default 3).
-  This controls API concurrency, not group size. Dependency review follows them.
+  This controls API concurrency, not group size. Without a triage dependency
+  review, dependency review follows them.
 - `GROUP_REQUEST_OPTIONS`: JSON request parameters supported by the configured
   grouping provider, such as `{"thinking":{"type":"enabled"},"reasoning_effort":"high"}`.
   No provider-specific mode is assumed by default; model/messages/stream cannot be overridden.
@@ -201,6 +238,10 @@ Relevant optional environment variables:
   `max_context_lines` (default 80). These limit context excerpts, not group size.
 - `CHAIN_CHECK_SCRIPT`: path to the API-chain checker; the generic runner
   derives it relative to its project root.
+- The checker accepts `--base <commit>` to reconstruct the candidate from the
+  patch; this overrides inherited `CHAIN_CHECK_REF`. Legacy callers may use
+  `CHAIN_CHECK_REF` or `CHAIN_CHECK_BASE_REF`. Missing/invalid references are errors,
+  never a request to scan the mutable working tree.
 - `CHAIN_CHECK_GLOBS`: comma-separated source patterns used by the chain check
   (defaults include Java, Kotlin, AIDL, C, C++, headers, Rust and Python).
 
@@ -210,8 +251,11 @@ The Python stages load modules relative to this source snapshot. The generic
 runner accepts `BACKPORT_ROOT`, `BACKPORT_PYTHON`, `BACKPORT_SCRIPTS`,
 `BACKPORT_DATASET`, `BACKPORT_CONFIG`, `BACKPORT_CASE` and `OUT` from the external
 launcher, so runtime paths need not be patched into the source. Dataset settings
-come from YAML; the generic runner forces `llm_model: deepseek-flash` and
-`llm_base_url: https://api.deepseek.com/v1` for generation and review.
+come from YAML. Explicit stage environment variables override the corresponding
+YAML settings; DeepSeek defaults apply only when no value is configured. Generation
+and review models remain independently configurable. API keys are inherited from
+the environment or read from the input configuration, then omitted from the generated
+case configuration. The target revision is pinned before pipeline stages run.
 Build/test hooks and environment-specific configuration remain external.
 Install the included requirements and configure any additional Tree-sitter grammars
 through `SOURCE_STRUCTURE_CONFIG`. Existing runner defaults remain available.

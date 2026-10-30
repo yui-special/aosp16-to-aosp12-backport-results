@@ -18,6 +18,13 @@ from tools.logger import logger
 from tools.source_structure import SymbolIndex
 
 
+class FinalValidationUnavailable(RuntimeError):
+    """An unavailable reviewer/checker is not itself evidence of a code defect."""
+    def __init__(self, message, repair_feedback=''):
+        super().__init__(message)
+        self.repair_feedback = repair_feedback
+
+
 class Project:
     def __init__(self, data: SimpleNamespace):
         self.project_url = data.project_url
@@ -51,6 +58,8 @@ class Project:
         self.last_context = []
         self.no_change_evidence = None
         self.final_artifact_check = None
+        self.final_validation_unavailable = False
+        self.final_repair_required = False
         # [P0] 文件"搬移推断"的递归深度（只允许一层，避免 5^k 重试爆炸）
         self._move_depth = 0
 
@@ -613,18 +622,11 @@ class Project:
         finally:
             os.unlink(patch_path)
 
-        if self.final_artifact_check is not None:
-            failure = self.final_artifact_check(complete_patch)
-            if failure:
-                return failure + '\nSubmit a complete revised patch addressing these obligations.\n'
-
         # compile the patch
         logger.debug("Start compile the patched source code")
         if not os.path.exists(os.path.join(self.dir, "build.sh")):
             logger.debug("No build.sh file found.")
-            ret += "The patched source code could be COMPILED successfully! I really thank you for your great efforts.\n"
-            self.compile_succeeded = True
-            return ret
+            return 'BUILD_UNAVAILABLE: build.sh is missing; compilation has not run.\n'
 
         # build_process = subprocess.Popen(
         #     ["/bin/bash", "build.sh"],
@@ -658,7 +660,9 @@ class Project:
             # stdout 和 stderr 都要：实测出现过 build.sh 失败但 stdout 为空、
             # 错误信息全在 stderr 的情况，模型收到空错误只能瞎猜。
             compile_stdout, compile_stderr = build_process.communicate(timeout=60 * 60)
-            compile_result = compile_stdout
+            compile_result = compile_stdout or ''
+            if (compile_stderr or '').strip():
+                compile_result += '\n[stderr]\n' + compile_stderr
         except subprocess.TimeoutExpired:
             build_process.kill()
             ret += f"The compilation process of the patched source code is timeout. "
@@ -668,7 +672,6 @@ class Project:
             )
             for patch in self.succeeded_patches:
                 logger.info(patch)
-            exit(0)
             return ret
 
         if build_process.returncode != 0:
@@ -829,15 +832,34 @@ class Project:
             self.compile_succeeded = False
             self.testcase_succeeded = False
             self.poc_succeeded = False
+            self.final_validation_unavailable = False
+            self.final_repair_required = False
             ret = self._compile_patch(self.full_patch_base or ref, patch)
             if self.compile_succeeded and not self.testcase_succeeded:
                 ret += self._run_testcase()
+            self.final_repair_required = not (self.compile_succeeded and self.testcase_succeeded)
+            # Collect build/test evidence even when semantic review is unavailable.
+            # Acceptance and validated checkpoints still require both kinds of evidence.
+            if self.final_artifact_check is not None:
+                try:
+                    failure = self.final_artifact_check(patch)
+                except FinalValidationUnavailable as exc:
+                    self.final_validation_unavailable = True
+                    self.final_repair_required |= bool(exc.repair_feedback)
+                    return (ret + '\nFINAL_VALIDATION_UNAVAILABLE: ' + str(exc)
+                            + '\nThis is not a code defect. Do not rewrite code to fix review availability. '
+                            'Only address concrete compilation/test/API/semantic findings below or above. '
+                            'Final acceptance remains pending.\n' + exc.repair_feedback)
+                if failure:
+                    self.final_repair_required = True
+                    return ret + '\n' + failure + '\nSubmit a complete revised patch addressing these findings.\n'
             if (
                 self.compile_succeeded
                 and self.testcase_succeeded
                 and not self.poc_succeeded
             ):
                 ret += self._run_poc(patch)
+            self.final_repair_required = not self.poc_succeeded
             return ret
         else:
             if patch.strip() == "need not ported":

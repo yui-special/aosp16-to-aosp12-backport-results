@@ -18,10 +18,11 @@ OUT=${OUT:-$CASE/runs/official}
 export CHAIN_CHECK_SCRIPT=${CHAIN_CHECK_SCRIPT:-$(dirname "$ROOT")/chain_check.py}
 
 config_value() {
-  "$PY" -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))[sys.argv[2]])' "$INPUT_CONFIG" "$1"
+  "$PY" -c 'import sys,yaml; d=yaml.safe_load(open(sys.argv[1])); print(next((d[k] for k in sys.argv[2:] if d.get(k)), ""))' "$INPUT_CONFIG" "$@"
 }
 REPO=$(config_value project_dir) || exit 1
 TARGET=$(config_value target_release) || exit 1
+TARGET=$(git -C "$REPO" rev-parse --verify "$TARGET^{commit}") || exit 1
 NEW_PATCH=$(config_value new_patch) || exit 1
 
 mkdir -p "$CASE/groups" "$CASE/inputs" "$OUT"
@@ -34,10 +35,11 @@ fail_stage() {
   exit "$rc"
 }
 
-# Stage 0：统一使用 DeepSeek 的 OpenAI-compatible API。
+# Stage 0：保留配置与阶段覆盖，未配置时使用 DeepSeek。
 export DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+export LLM_BASE_URL=${LLM_BASE_URL:-$(config_value llm_base_url)}
 export LLM_BASE_URL=${LLM_BASE_URL:-$DEEPSEEK_BASE_URL}
-LLM_KEY=${DEEPSEEK_API_KEY:-${LLM_KEY:-}}
+LLM_KEY=${DEEPSEEK_API_KEY:-${LLM_KEY:-$(config_value deepseek_api_key api_key openai_key)}}
 export LLM_KEY
 code=$(timeout 12 curl -s --tlsv1.2 --tls-max 1.2 -o /dev/null -w "%{http_code}" \
   "${LLM_ENDPOINT:-$LLM_BASE_URL/models}" 2>/dev/null)
@@ -48,10 +50,18 @@ fi
 echo "preflight endpoint=$code" >> "$OUT/status.txt"
 
 export DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-flash}
-export SUMMARY_MODEL=${SUMMARY_MODEL:-$DEEPSEEK_MODEL}
+export LLM_MODEL=${LLM_MODEL:-$(config_value llm_model)}
+export LLM_MODEL=${LLM_MODEL:-$DEEPSEEK_MODEL}
+export COVERAGE_MODEL=${COVERAGE_MODEL:-$(config_value coverage_model)}
+export COVERAGE_MODEL=${COVERAGE_MODEL:-$LLM_MODEL}
+export SUMMARY_MODEL=${SUMMARY_MODEL:-$(config_value summary_model)}
+export SUMMARY_MODEL=${SUMMARY_MODEL:-$LLM_MODEL}
+export GROUP_MODEL=${GROUP_MODEL:-$(config_value group_model)}
 export GROUP_MODEL=${GROUP_MODEL:-$SUMMARY_MODEL}
-export TRIAGE_MODEL=${TRIAGE_MODEL:-$DEEPSEEK_MODEL}
-export MAP_MODEL=${MAP_MODEL:-$DEEPSEEK_MODEL}
+export TRIAGE_MODEL=${TRIAGE_MODEL:-$(config_value triage_model)}
+export TRIAGE_MODEL=${TRIAGE_MODEL:-$LLM_MODEL}
+export MAP_MODEL=${MAP_MODEL:-$(config_value map_model)}
+export MAP_MODEL=${MAP_MODEL:-$LLM_MODEL}
 if [ -z "${LLM_KEY:-}" ]; then echo "NO_KEY" >> "$OUT/status.txt"; exit 1; fi
 
 echo "[0/6] detect languages" | tee -a "$OUT/status.txt"
@@ -119,16 +129,21 @@ if [ "${STOP_AFTER_EXPORT:-0}" = "1" ]; then
   exit 0
 fi
 
-cp -f "$INPUT_CONFIG" "$CFG" || fail_stage config 1
-grep -vE '^(openai_key|api_key|deepseek_api_key|llm_base_url|llm_model|coverage_model|use_azure|azure_endpoint|azure_deployment|azure_api_version|merged_hunks_dir)[[:space:]]*:' \
-  "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
-{
-  echo "llm_base_url: $LLM_BASE_URL"
-  echo "llm_model: $DEEPSEEK_MODEL"
-  echo "coverage_model: $DEEPSEEK_MODEL"
-  echo "use_azure: false"
-  echo "merged_hunks_dir: $CASE/inputs/merged_hunks/original"
-} >> "$CFG"
+"$PY" - "$INPUT_CONFIG" "$CFG" "$CASE/inputs/merged_hunks/original" "$TARGET" <<'PY'
+import os, sys, yaml
+source, destination, merged_hunks, target = sys.argv[1:]
+with open(source, encoding='utf-8') as handle:
+    data = yaml.safe_load(handle)
+for key in ('openai_key', 'api_key', 'deepseek_api_key', 'azure_endpoint',
+            'azure_deployment', 'azure_api_version'):
+    data.pop(key, None)
+data.update(llm_base_url=os.environ['LLM_BASE_URL'], llm_model=os.environ['LLM_MODEL'],
+            coverage_model=os.environ['COVERAGE_MODEL'], use_azure=False,
+            merged_hunks_dir=merged_hunks, target_release=target)
+with open(destination, 'w', encoding='utf-8') as handle:
+    yaml.safe_dump(data, handle, sort_keys=False, allow_unicode=True)
+PY
+[ "$?" = 0 ] || fail_stage config 1
 
 echo "[6/6] generate" | tee -a "$OUT/status.txt"
 git -C "$REPO" reset --hard >/dev/null 2>&1
@@ -143,10 +158,11 @@ cp -a "$CASE/inputs/merged_hunks/ported/." "$OUT/" 2>/dev/null || true
 
 # API 链完整性检查（改签名后是否还有调用点用旧参数个数）
 if [ -f "$OUT/complete.patch" ]; then
-  CHAIN_CHECK_BASE_REF="$TARGET" \
-    "$PY" "$(dirname "$ROOT")/chain_check.py" "$REPO" "$OUT/complete.patch" \
+  "$PY" "$CHAIN_CHECK_SCRIPT" "$REPO" "$OUT/complete.patch" --base "$TARGET" \
     > "$OUT/chain-report.txt" 2>&1
-  echo "chain rc=$?" >> "$OUT/status.txt"
+  chain_rc=$?
+  echo "chain rc=$chain_rc" >> "$OUT/status.txt"
+  if [ "$rc" = 0 ] && [ "$chain_rc" != 0 ]; then rc=$chain_rc; fi
 fi
 
 "$PY" "$(dirname "$ROOT")/make_verdict.py" "$CASE" "$OUT" >> "$OUT/status.txt" 2>&1 || true
