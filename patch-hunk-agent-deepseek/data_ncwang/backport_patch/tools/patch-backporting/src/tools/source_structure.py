@@ -212,26 +212,6 @@ class Source:
     def symbols(self):
         return [(d["name"], d["name_line"]) for d in self.declarations if d["kind"] != "lambda"]
 
-    @lru_cache(maxsize=8)
-    def java_imports(self):
-        """Explicit type imports only; shadowing/ambiguity prevents automatic edges."""
-        imports, shadowed = {}, set()
-        if self.language != "java" or self.status != "ok":
-            return imports, shadowed
-        for node in walk(self.tree.root_node):
-            if node.type == "import_declaration":
-                match = re.fullmatch(r"import\s+([\w.]+)\s*;", self.text(node).strip())
-                if match:
-                    qualified = match[1]
-                    imports.setdefault(qualified.rsplit(".", 1)[-1], []).append({
-                        "qualified_name": qualified, "line": node.start_point.row + 1,
-                        "text": self.text(node)})
-            elif node.type in TYPES | {"variable_declarator", "formal_parameter", "type_parameter"}:
-                name = declarator_name(node) or typed_child(node, "type_identifier")
-                if name:
-                    shadowed.add(self.text(name))
-        return imports, shadowed
-
     def evidence(self, changed_lines, start, count):
         """Scopes contain changed lines; context-only neighbours do not own a hunk."""
         lines = set(changed_lines)
@@ -250,7 +230,6 @@ class Source:
                   "range": [start, count], "changed_lines": sorted(lines),
                   "scope_basis": "changed_lines" if lines else "context_only",
                   "scopes": [], "enclosing_functions": ancestors, "calls": [], "identifiers": [],
-                  "imports": [], "import_uses": [], "statements": [],
                   "writes": [], "declarations": [{k: d[k] for k in ("name", "qualified_name", "signature", "kind")}
                      for d in self.declarations if d["kind"] == "symbol" and d["name_line"] in lines]}
         if self.reason:
@@ -261,9 +240,6 @@ class Source:
             entry["signature_changed"] = any(d["start"] <= n <= d["signature_end"] for n in lines)
             result["scopes"].append(entry)
         if self.tree:
-            imports, shadowed = self.java_imports()
-            result["imports"] = [entry for entries in imports.values() for entry in entries
-                                 if entry["line"] in lines]
             identifiers = set()
             stack = [self.tree.root_node]
             while stack:
@@ -271,25 +247,7 @@ class Source:
                 if not any(n.start_point.row + 1 <= line <= n.end_point.row + 1 for line in lines):
                     continue
                 if n.type in IDENTIFIERS:
-                    name = self.text(n)
-                    identifiers.add(name)
-                    # A qualified use, string/comment or shadowed name is not proof
-                    # that this import supplies the identifier. Static/wildcard
-                    # imports and other languages remain semantic-review work.
-                    entries = imports.get(name, [])
-                    if (len(entries) == 1 and name not in shadowed and n.parent
-                            and n.parent.type not in {"scoped_identifier", "scoped_type_identifier",
-                                                      "field_access", "import_declaration"}
-                            and (n.type == "type_identifier" or
-                                 (n.parent.type == "method_invocation" and child(n.parent, "object") == n))):
-                        result["import_uses"].append({"qualified_name": entries[0]["qualified_name"],
-                                                     "line": n.start_point.row + 1, "identifier": name})
-                if n.type in {"expression_statement", "return_statement", "assert_statement",
-                              "throw_statement", "local_variable_declaration"}:
-                    # Keep the complete changed statement: an assertion's receiver
-                    # often lies on an unchanged line above its new expected value.
-                    result["statements"].append({"line": n.start_point.row + 1,
-                                                "end": n.end_point.row + 1, "text": self.text(n)})
+                    identifiers.add(self.text(n))
                 if n.type in CALLS:
                     name = child(n, "name", "function", "type")
                     args = child(n, "arguments") or typed_child(n, "value_arguments")

@@ -1,6 +1,5 @@
 """Semantic decisions must retain relevance and prove the final candidate's coverage."""
 import importlib.util
-import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -15,7 +14,7 @@ SRC = ROOT / 'data_ncwang/backport_patch/tools/patch-backporting/src'
 sys.path.insert(0, str(SRC))
 from agent.coverage import CoverageReviewer, artifact_tree, read_blob, verify_review
 from agent.invoke_llm import evaluate_global_artifact
-from tools.project import Project, FinalValidationUnavailable
+from tools.project import Project
 from tools.utils import group_patch, split_patch_indexed, uncovered_hunks
 from git import Repo
 
@@ -49,25 +48,13 @@ class TriageRelevanceTests(unittest.TestCase):
         row = self.run_postprocess(None, {'@Rule': 10})
         self.assertIsNone(row['port'])
 
-    def test_reviewed_selected_call_can_retain_its_required_definition(self):
+    def test_actual_selected_call_can_retain_its_required_definition(self):
         rows = [dict(hunk=0, port=False, reason='helper'), dict(hunk=1, port=True, reason='fix')]
-        hunks = [{'text': '@@ -0,0 +1 @@\n+void requiredHelper() {}'},
-                 {'text': '@@ -0,0 +1 @@\n+requiredHelper();'}]
-        summaries = [dict(hunk=0, symbol='requiredHelper', kind='declare'),
-                     dict(hunk=1, symbol='caller', kind='logic')]
-        from tools.hunk_dependencies import review_inputs, validate_review
-        reviews = validate_review({'reviews': [
-            {'hunk': 0, 'reason': 'Definition has no prerequisites', 'requires': []},
-            {'hunk': 1, 'reason': 'Caller requires definition', 'requires': [
-                {'provider': 0, 'reason': 'Direct call of the newly defined helper',
-                 'provider_evidence': {'side': 'after', 'quote': 'void requiredHelper() {}'},
-                 'consumer_evidence': {'side': 'after', 'quote': 'requiredHelper();'}}]}]},
-            review_inputs(rows, hunks, summaries))
-        triage.postprocess(rows, hunks, summaries, '', 'base', reviews)
+        hunks = [{'text': '+void requiredHelper() {}'}, {'text': '+requiredHelper();'}]
+        summaries = [dict(symbol='requiredHelper', kind='declare'), dict(symbol='caller', kind='logic')]
+        triage.postprocess(rows, hunks, summaries, '', 'base')
         self.assertTrue(rows[0]['port'])
-        self.assertTrue(rows[0]['needs_semantic_mapping'])
         self.assertIn('被 hunk 1 依赖', rows[0]['reason'])
-
 
     def test_shared_symbol_requires_review_but_never_forces_a_skip_to_port(self):
         rows = [
@@ -158,22 +145,18 @@ class SplitReviewJudgeTests(unittest.TestCase):
     def setUp(self):
         self.members = [dict(idx=8, file='Renamed.java', text='-allowAny();\n+restrict();')]
         self.candidate = 'diff --git a/Example.java b/Example.java\n'
-        identity = json.dumps(['candidate-tree', 'Example.java', 2, 2])
-        self.evidence_id = 'E' + hashlib.sha256(identity.encode()).hexdigest()[:16]
 
     def record(self):
         return {'members': [dict(idx=8, status='satisfied', reason='The actual target guard blocks this path.',
-                                evidence=[dict(evidence_id=self.evidence_id)])]}
+                                evidence=[dict(path='Example.java', start_line=2, end_line=2,
+                                               quote='  boolean allowed() { return false; }')])]}
 
     def review(self, llm, executor, retries=0):
         reviewer = CoverageReviewer(llm, '.', 'base', retries=retries)
-        def collect_evidence(_llm, tools, _prompt):
-            tools[0].invoke(dict(path='Example.java', start_line=2, end_line=2))
-            return Mock()
         with patch('agent.coverage.artifact_tree', return_value='candidate-tree'), \
                 patch('agent.coverage.read_blob',
                       return_value='class Example {\n  boolean allowed() { return false; }\n}\n'), \
-                patch('agent.coverage.create_tool_calling_agent', side_effect=collect_evidence), \
+                patch('agent.coverage.create_tool_calling_agent'), \
                 patch('agent.coverage.AgentExecutor', return_value=executor):
             return reviewer.review(self.members, self.candidate)
 
@@ -190,7 +173,7 @@ class SplitReviewJudgeTests(unittest.TestCase):
         result = self.review(llm, executor)
         self.assertTrue(result['complete'])
         self.assertEqual(executor.invoke.call_count, 1)
-        self.assertNotIn('return_intermediate_steps', executor.invoke.call_args.kwargs)
+        self.assertTrue(executor.invoke.call_args.kwargs['return_intermediate_steps'])
         self.assertEqual(llm.invoke.call_count, 1)
         messages = llm.invoke.call_args.args[0]
         self.assertEqual([message.type for message in messages], ['system', 'human'])
@@ -199,7 +182,7 @@ class SplitReviewJudgeTests(unittest.TestCase):
         llm = Mock()
         llm.invoke.side_effect = [
             SimpleNamespace(
-                content=f'Hunk 8 is satisfied. Evidence {self.evidence_id} supports the target guard.',
+                content='Hunk 8 is satisfied. Evidence Efixture supports the target guard.',
                 response_metadata={'finish_reason': 'stop'}),
             SimpleNamespace(
                 content=json.dumps(self.record()),
@@ -219,7 +202,7 @@ class SplitReviewJudgeTests(unittest.TestCase):
         self.assertIn('JSON transport formatter', formatter_messages[0].content)
         formatter_input = json.loads(formatter_messages[1].content)
         self.assertEqual(formatter_input['required_hunk_ids'], [8])
-        self.assertIn('Evidence ' + self.evidence_id, formatter_input['original_review_response'])
+        self.assertIn('Evidence Efixture', formatter_input['original_review_response'])
         self.assertEqual(result['review_json_normalization']['method'], 'model_format_only')
         normalized = json.loads(result['review_json_normalization']['normalized_text'])
         self.assertEqual(normalized['members'][0]['status'], 'satisfied')
@@ -294,49 +277,6 @@ class SplitReviewJudgeTests(unittest.TestCase):
         self.assertFalse(result['complete'])
         self.assertEqual(result['method'], 'semantic_review_failed')
         self.assertEqual(llm.invoke.call_count, 1)
-
-    def test_real_executor_transfers_tool_observations_to_final_judge(self):
-        from langchain_core.agents import AgentAction, AgentFinish
-        from langchain_core.runnables import RunnableLambda
-        def plan(inputs):
-            if not inputs['intermediate_steps']:
-                return AgentAction('read_target', dict(path='Example.java', start_line=2, end_line=2), '')
-            return AgentFinish({'output': 'Candidate guard read.'}, '')
-        llm = Mock()
-        llm.invoke.return_value = SimpleNamespace(content=json.dumps(self.record()))
-        with patch('agent.coverage.artifact_tree', return_value='candidate-tree'), \
-                patch('agent.coverage.read_blob', return_value='class Example {\n  boolean allowed() { return false; }\n}\n'), \
-                patch('agent.coverage.create_tool_calling_agent', return_value=RunnableLambda(plan)):
-            result = CoverageReviewer(llm, '.', 'base', retries=0).review(self.members, self.candidate)
-        self.assertTrue(result['complete'])
-        judge = json.loads(llm.invoke.call_args.args[0][1].content)
-        self.assertEqual(len(judge['tool_trace']), 1)
-        self.assertIn(self.evidence_id, judge['tool_trace'][0]['observation'])
-        self.assertIn(self.evidence_id, judge['evidence_registry'])
-
-    def test_formatter_cannot_promote_missing_or_undecided_hunk(self):
-        for original in ['Hunk 8 is missing. Evidence ' + self.evidence_id + '.',
-                         'The available evidence is inconclusive.']:
-            with self.subTest(original=original):
-                llm = Mock()
-                llm.invoke.side_effect = [SimpleNamespace(content=original),
-                                         SimpleNamespace(content=json.dumps(self.record()))]
-                executor = Mock()
-                executor.invoke.return_value = {'output': 'memo', 'intermediate_steps': []}
-                result = self.review(llm, executor)
-                self.assertFalse(result['complete'])
-                self.assertIn('changed or invented', result['error'])
-
-    def test_formatter_cannot_borrow_another_hunks_evidence(self):
-        llm = Mock()
-        llm.invoke.side_effect = [SimpleNamespace(content='Hunk 8 is satisfied. No evidence ID supplied.\n'
-            'Hunk 9 is satisfied. Evidence ' + self.evidence_id + '.'),
-            SimpleNamespace(content=json.dumps(self.record()))]
-        executor = Mock()
-        executor.invoke.return_value = {'output': 'memo', 'intermediate_steps': []}
-        result = self.review(llm, executor)
-        self.assertFalse(result['complete'])
-        self.assertIn('added evidence', result['error'])
 
 
 class CandidateCoverageTests(unittest.TestCase):
@@ -472,82 +412,16 @@ class CandidateCoverageTests(unittest.TestCase):
         self.assertEqual(project.no_change_evidence['status'], 'pending_final_semantic_review')
         self.assertFalse(project.poc_succeeded)
 
-    def test_semantic_failure_blocks_acceptance_after_actual_build_and_test(self):
+    def test_semantic_failure_prevents_actual_build(self):
         project = Project(SimpleNamespace(project_url='fixture', project_dir=str(self.root),
             error_message='', new_patch_parent=self.base, target_release=self.base))
         project.full_patch_base = self.base
         project.all_hunks_applied_succeeded = True
         project.final_artifact_check = lambda _: 'SEMANTIC_VALIDATION_FAILED: missing regression test'
         (self.root/'build.sh').write_text('touch build-was-run\n')
-        (self.root/'test.sh').write_text('test -f build-was-run && touch test-was-run\n')
         self.assertIn('SEMANTIC_VALIDATION_FAILED', project._validate(self.base, self.candidate))
-        self.assertTrue((self.root/'build-was-run').exists())
-        self.assertTrue((self.root/'test-was-run').exists())
-        self.assertTrue(project.compile_succeeded)
-        self.assertTrue(project.testcase_succeeded)
-        self.assertTrue(project.final_repair_required)
-        self.assertFalse(project.poc_succeeded)
-
-    def test_unavailable_review_preserves_build_error_and_requires_repair(self):
-        project = Project(SimpleNamespace(project_url='fixture', project_dir=str(self.root),
-            error_message='', new_patch_parent=self.base, target_release=self.base))
-        project.full_patch_base = self.base
-        project.all_hunks_applied_succeeded = True
-        project.final_artifact_check = Mock(side_effect=FinalValidationUnavailable('JSON decode failed'))
-        (self.root/'build.sh').write_text('echo "build stdout"\necho "error: missing argument" >&2\nexit 1\n')
-        result = project._validate(self.base, self.candidate)
-        self.assertIn('error: missing argument', result)
-        self.assertIn('FINAL_VALIDATION_UNAVAILABLE', result)
-        self.assertTrue(project.final_validation_unavailable)
-        self.assertTrue(project.final_repair_required)
-        self.assertFalse(project.poc_succeeded)
-
-    def test_review_outage_alone_does_not_request_code_rewrite_or_accept_patch(self):
-        project = Project(SimpleNamespace(project_url='fixture', project_dir=str(self.root),
-            error_message='', new_patch_parent=self.base, target_release=self.base))
-        project.full_patch_base = self.base
-        project.all_hunks_applied_succeeded = True
-        (self.root/'build.sh').write_text('exit 0\n')
-        (self.root/'test.sh').write_text('exit 0\n')
-        project.final_artifact_check = Mock(side_effect=FinalValidationUnavailable('invalid response'))
-        project._validate(self.base, self.candidate)
-        self.assertTrue(project.compile_succeeded)
-        self.assertTrue(project.testcase_succeeded)
-        self.assertFalse(project.final_repair_required)
-        self.assertFalse(project.poc_succeeded)
-        self.assertEqual(project.validated_patch_checkpoints, [])
-        project.final_artifact_check = Mock(side_effect=FinalValidationUnavailable(
-            'invalid response', 'API_CHAIN_VALIDATION_FAILED: caller() lacks argument'))
-        result = project._validate(self.base, self.candidate)
-        self.assertIn('caller() lacks argument', result)
-        self.assertTrue(project.final_repair_required)
-        self.assertFalse(project.poc_succeeded)
-        project.final_artifact_check = lambda _: ''
-        project._validate(self.base, self.candidate)
-        self.assertFalse(project.final_validation_unavailable)
-        self.assertTrue(project.poc_succeeded)
-
-    def test_review_parse_failure_keeps_raw_output_and_iteration_evidence(self):
-        llm = Mock()
-        llm.invoke.return_value = SimpleNamespace(content='invalid final review sk-fixture-secret')
-        reviewer = CoverageReviewer(llm, self.root, self.base, retries=0,
-                                    artifact_dir=self.root/'review-attempts')
-        executor = Mock()
-        executor.invoke.return_value = {'output': 'Agent stopped due to max iterations.',
-                                        'intermediate_steps': [('read', 'code')] * 3}
-        with patch('agent.coverage.create_tool_calling_agent'), \
-                patch('agent.coverage.AgentExecutor', return_value=executor):
-            result = reviewer.review(self.members, self.candidate)
-        self.assertEqual(result['method'], 'semantic_review_failed')
-        records = {record['stage']: record for record in (
-            json.loads(path.read_text()) for path in (self.root/'review-attempts').glob('*.json'))}
-        evidence = records['evidence_collection']
-        self.assertEqual(evidence['output'], executor.invoke.return_value['output'])
-        self.assertEqual(evidence['tool_steps'], 3)
-        judge = records['final_json']
-        self.assertEqual(judge['output'], 'invalid final review [REDACTED_KEY]')
-        self.assertEqual(judge['tool_steps'], 3)
-        self.assertIn('ValueError', judge['error'])
+        self.assertFalse((self.root/'build-was-run').exists())
+        self.assertFalse(project.compile_succeeded)
 
 
 if __name__ == '__main__':

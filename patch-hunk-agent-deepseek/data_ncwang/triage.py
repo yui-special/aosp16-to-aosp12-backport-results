@@ -3,24 +3,41 @@
 """逐 hunk 分诊：这个 hunk 到底要不要移植到目标版本。
 
 输入：patch + summaries.json（已算好的 kind/symbol/summary/enclosing）+ CVE 描述
-输出：triaged.json —— 每个 hunk 的移植决定与独立的闭包复核标记。
-review_required=True 只表示同名符号值得复核，不改变 port 决定。
+输出：triaged.json —— 每个 hunk 的移植决定和独立的闭包复核标记
+
+port=True   必须修改目标代码。
+port=False  不修改目标代码。
+review_required=True 仅表示命中了符号闭包，仍需判断目标版本是否适用；
+                     绝不把 hunk 自动加入 Patch。
 
 用法: triage.py <patch> <summaries.json> <cve_desc> <out.json> [model]
 """
 import json
 import os
-from pathlib import Path
+import re
+import signal
+import ssl
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "backport_patch/tools/patch-backporting/src"))
 from tools.utils import split_patch_indexed  # noqa: E402
-from tools.hunk_dependencies import (fingerprint, review_dependencies, syntax_prerequisites)  # noqa: E402
 
+BASE = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+SYS = "你是安全补丁回移植审阅者，能处理多种编程语言。只输出严格 JSON，不要 markdown、不要解释。"
 LEGACY_SYMBOL_CLOSURE_SUFFIX = " | 符号闭包："
+
+
+class _CallTimeout(Exception):
+    pass
+
+
+def _alarm(signum, frame):
+    raise _CallTimeout("LLM call timeout")
 
 TPL = """上游提交里混着三类内容：
   ① fix       —— 目标 CVE 的修复语义，必须移植
@@ -31,18 +48,11 @@ CVE 描述：{desc}
 目标版本通常比上游旧，上游新增的设施在目标里可能不存在。
 先判断该改动与修复语义是否相关；上游类名、函数名或文件在目标缺失，不构成无关的证据。
 修复逻辑及其必要测试需要映射到目标的等价实现。纯粹为上游测试管理功能开关的
-Rule 或测试运行器若仅服务上游设施且与修复及其验证无关，应判 unrelated。
-必要导入、声明、初始化、测试预期依赖的输出也属于 fix，不能因没有独立修复行为就跳过。
-kind/symbol 只是摘要线索，noise 不等于 metadata。
-移除开关条件可能改变安全行为；删除已无引用的开关声明属于独立清理，不自动成为修复前提。
-分诊不猜测目标是否具有某个类名，也不把目标不存在上游设施当作跳过修复的理由。
+Rule、导入或测试运行器，若不改变修复行为且目标不需要该设施，应判 unrelated。
 
 hunk 所在文件：{file}
 这个 hunk 在函数里做了什么（摘要）：{summary}
 类型：{kind}；符号：{symbol}；所在函数：{enclosing}
-
-语义契约：{contract}
-源码证据：{structure}
 
 patch 内容：
 ```diff
@@ -54,26 +64,45 @@ patch 内容：
 """
 
 
-def call(key, model, prompt, *, dependency=False):
-    # Share response/error handling with the summary stage; options are external.
-    from summarize_and_group import call_json
-    options = os.environ.get("TRIAGE_REQUEST_OPTIONS", '{"temperature":0}')
-    timeout = os.environ.get("TRIAGE_READ_TIMEOUT", "60")
-    if dependency:
-        options = os.environ.get("TRIAGE_DEPENDENCY_REQUEST_OPTIONS", options)
-        timeout = os.environ.get("TRIAGE_DEPENDENCY_READ_TIMEOUT",
-                                 os.environ.get("GROUP_READ_TIMEOUT", "300"))
-    options, timeout = json.loads(options), float(timeout)
-    return call_json(key, model, prompt, request_options=options, read_timeout=timeout)
+def call(key, model, prompt):
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYS},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+    }
+    req = urllib.request.Request(
+        BASE + "/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+    )
+    # 该网关 TLS 1.3 握手会卡死，强制 1.2（与 CVE 无关的环境适配）
+    try:
+        ctx = ssl.create_default_context()
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    except Exception:  # noqa: BLE001
+        ctx = None
+    # urllib 在服务端半关闭（CLOSE-WAIT）时会永久挂起，timeout 参数不生效，
+    # 用 SIGALRM 给每次调用加硬上限。
+    signal.signal(signal.SIGALRM, _alarm)
+    signal.alarm(60)
+    try:
+        with urllib.request.urlopen(req, timeout=55, context=ctx) as r:
+            return json.loads(r.read())["choices"][0]["message"]["content"]
+    finally:
+        signal.alarm(0)
 
 
-def validate_decision(obj):
-    if (not isinstance(obj, dict) or type(obj.get("port")) is not bool
-            or obj.get("category") not in {"fix", "metadata", "unrelated"}
-            or obj["port"] != (obj["category"] == "fix")
-            or not isinstance(obj.get("reason"), str) or not obj["reason"].strip()):
-        raise ValueError("triage requires boolean port, consistent category, and reason")
-    return obj
+def parse_json(text):
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
 
 
 def git_count(repo, ref, name, path=None):
@@ -94,92 +123,182 @@ def git_count(repo, ref, name, path=None):
         return len(p.stdout.strip().splitlines())
 
 
-def postprocess(rows, hunks, summaries, repo, target_ref, reviews=None):
-    """Close only evidenced prerequisites; summary names never select hunks."""
-    by_id = {r["hunk"]: r for r in rows}
+# 识别「这个 hunk 定义/声明了哪个符号」。
+# 要同时覆盖 C（static int foo(...）和 Java/AIDL（private boolean foo(...)/void foo(...);）
+DEF_RE = re.compile(
+    r"#define\s+(\w+)"
+    r"|(?:^|\s)(?:(?:public|private|protected|static|final|abstract|synchronized|native|default|"
+    r"extern|inline|SQLITE_PRIVATE|SQLITE_API)\s+)*"
+    r"(?:[\w<>\[\],.?]+\s+)+(\w+)\s*\("
+)
+
+
+def _mapping_terms(summary):
+    """Terms that can reveal a renamed/moved equivalent in the target."""
+    contract = summary.get("semantic_contract") or {}
+    values = []
+    for key in ("search_terms", "call_chain", "callers", "callees",
+                "symbol_relations", "prerequisite_semantics"):
+        value = contract.get(key) or []
+        if isinstance(value, str):
+            value = [value]
+        values.extend(str(item).strip() for item in value)
+    values.extend([
+        str(summary.get("det_enclosing") or "").strip(),
+        str(summary.get("symbol_inferred") or summary.get("symbol") or "").strip(),
+    ])
+    seen, out = set(), []
+    for term in values:
+        # Keep identifiers/functions/class names and longer error strings. Short words
+        # such as "true" or "error" are not evidence of semantic equivalence.
+        if len(term) < 4 or term in seen:
+            continue
+        if not re.search(r"[A-Za-z_]", term):
+            continue
+        seen.add(term)
+        out.append(term)
+    return out[:12]
+
+
+def postprocess(rows, hunks, summaries, repo, target_ref):
+    """Mechanical safeguards around the LLM decisions."""
+    # Relevance is decided here; target equivalence is checked by the dedicated
+    # mapping stage. Repeating repository-wide keyword searches here both
+    # conflates those decisions and promotes unrelated framework vocabulary.
     for row in rows:
-        if not isinstance(row.get("initial_decision"), dict):
+        # Restore the model's own decision before recomputing mechanical closure.
+        # This makes TRIAGE_POST_ONLY deterministic: an older run that promoted a
+        # hunk through the former name-wide rule cannot keep that stale promotion.
+        initial = row.get("initial_decision")
+        if not isinstance(initial, dict):
             reason = row.get("reason") or ""
             if row.get("port") is True and LEGACY_SYMBOL_CLOSURE_SUFFIX in reason:
+                # Older outputs did not persist initial_decision. The exact
+                # code-owned suffix proves this row was promoted by the former
+                # name-wide rule, so restore the only fact we can know safely:
+                # the model did not decide to port it. Category remains unknown.
                 row["initial_decision"] = {
-                    "port": False, "category": "unknown",
+                    "port": False,
+                    "category": "unknown",
                     "reason": reason.split(LEGACY_SYMBOL_CLOSURE_SUFFIX, 1)[0],
                 }
             else:
-                row["initial_decision"] = {k: row.get(k) for k in ("port", "category", "reason")}
-        row.update(row["initial_decision"])
+                row["initial_decision"] = {
+                    k: row.get(k) for k in ("port", "category", "reason")
+                }
+        initial = row["initial_decision"]
+        for key in ("port", "category", "reason"):
+            if key in initial:
+                row[key] = initial[key]
         row.pop("func_in_target", None)
         row.pop("semantic_candidates", None)
-        row.pop("dependency_review", None)
-        row.pop("dependency_fingerprint", None)
-        row.pop("dependency_status", None)
-        row["retained_by"] = []
-        row.update(review_required=False, closure_symbols=[], review_reason="")
-    edges = syntax_prerequisites(summaries)
-    if reviews is not None:
-        edges += [{**edge, "consumer": consumer, "kind": "reviewed_prerequisite"}
-                  for consumer, review in reviews.items() for edge in review["requires"]]
-    unique = {}
-    for edge in edges:
-        unique.setdefault((edge["provider"], edge["consumer"], edge["reason"]), edge)
-    edges = list(unique.values())
-    # Monotonic worklist, with no arbitrary closure-depth limit.
-    incoming = {}
-    for edge in edges:
-        incoming.setdefault(edge["consumer"], []).append(edge)
-    pending = sorted(h for h, row in by_id.items() if row.get("port") is True)
-    visited = set()
-    while pending:
-        consumer = pending.pop()
-        if consumer in visited:
-            continue
-        visited.add(consumer)
-        for edge in incoming.get(consumer, []):
-            row = by_id[edge["provider"]]
-            # An API failure is unresolved, even when another hunk mentions it.
-            if row.get("port") is None:
-                continue
-            row["retained_by"].append(edge)
-            if row.get("port") is not True:
-                row.update(port=True, category="fix", reason=(row.get("reason") or "") +
-                           " | 被 hunk %d 依赖：%s" % (consumer, edge["reason"]))
-                pending.append(row["hunk"])
-    for row in rows:
         row["needs_semantic_mapping"] = row.get("port") is True
-        row["triage_state"] = ("port_required" if row.get("port") is True else
-                               "not_required" if row.get("port") is False else "undecided")
-    # Same-name evidence is a review hint only. Actual retention remains governed
-    # by the scoped syntax/reviewed prerequisites above, with no closure-depth cap.
-    by_symbol = {}
-    for i, summary in enumerate(summaries):
-        symbol = summary.get("symbol")
-        if symbol and symbol not in {"?", "-"}:
-            by_symbol.setdefault(symbol, []).append(summary.get("hunk", i))
-    for symbol, ids in by_symbol.items():
-        if not any(by_id[h].get("port") is True for h in ids):
-            continue
-        for h in ids:
-            row = by_id[h]
-            if row.get("port") is False:
-                row.update(review_required=True, triage_state="review_only_closure",
-                           closure_symbols=sorted(set(row["closure_symbols"]) | {symbol}),
-                           review_reason="符号闭包复核：%s 同链另有必须移植的 hunk；本 hunk 不自动移植" % symbol)
-    if reviews is not None:
-        by_hunk = {h.get("idx", i): h for i, h in enumerate(hunks)}
-        for summary in summaries:
-            h = summary["hunk"]
-            row = by_id[h]
-            # Include syntax edges too, so grouping receives exactly the same DAG.
-            review = {**reviews[h], "requires": list(reviews[h]["requires"])}
-            seen = {e["provider"] for e in review["requires"]}
-            for edge in incoming.get(h, []):
-                if edge["provider"] not in seen:
-                    review["requires"].append(edge)
-                    seen.add(edge["provider"])
-            row["dependency_review"] = review
-            row["dependency_fingerprint"] = fingerprint(summary, by_hunk[h])
-            row["dependency_status"] = "complete"
+        row["review_required"] = False
+        row["closure_symbols"] = []
+        row["review_reason"] = ""
+        row["triage_state"] = (
+            "port_required" if row.get("port") is True
+            else "not_required" if row.get("port") is False
+            else "undecided"
+        )
+
+    # 规则 2/3 需要迭代到不动点：提升一个 hunk 后，它可能又拉出新的依赖
+    for _round in range(5):
+        changed = _closure_once(rows, hunks, summaries)
+        if not changed:
+            break
     return rows
+
+
+def _closure_once(rows, hunks, summaries):
+    """跑一轮依赖闭包 + 符号闭包，返回是否有改动。
+
+    规则 2（依赖闭包）：PORT hunk 用到的符号若由某个 skip hunk 定义 -> 提回该 hunk。
+    规则 3（符号闭包）：同一 symbol 中只要有一处必须移植，其余 skip hunk
+      加入独立复核集合，但不改变 port/category。共享 symbol 只是“可能需要
+      一起检查”的证据，不能证明测试适配、文档或无关调用点也必须进入 Patch。
+      只有规则 2 的真实依赖证明才允许把 port=False 提升为 True。
+    """
+    changed = False
+
+    # 补 symbol：摘要偶尔会给空 symbol（尤其插入型 hunk）。用新增行里最常出现的
+    # 已知 symbol 补上，这是纯机械推断，不依赖具体 CVE。
+    known = {(s.get("symbol") or "").strip() for s in summaries} - {""}
+    for h, s in zip(hunks, summaries):
+        if (s.get("symbol") or "").strip() or not known:
+            continue
+        added = "\n".join(l for l in h["text"].split("\n") if l.startswith("+"))
+        counts = {}
+        for sym in known:
+            n = len(re.findall(r"\b%s\b" % re.escape(sym), added))
+            if n:
+                counts[sym] = n
+        if counts:
+            s["symbol_inferred"] = max(counts, key=counts.get)
+
+    # 只把「声明/实现」类 hunk 当作定义方；call/logic 类不算，
+    # 否则调用行也会被误当成定义，导致整包被拉进来。
+    defined = {}
+    for i, s in enumerate(summaries):
+        if rows[i].get("port"):
+            continue
+        if (s.get("kind") or "").strip() not in ("declare", "implement"):
+            continue
+        sym = (s.get("symbol_inferred") or s.get("symbol") or "").strip()
+        if sym and len(sym) > 2:
+            defined.setdefault(sym, []).append(i)
+    for r, h in zip(rows, hunks):
+        if not r.get("port"):
+            continue
+        added = "\n".join(l for l in h["text"].split("\n") if l.startswith("+"))
+        for name, idxs in defined.items():
+            if not re.search(r"\b%s\b" % re.escape(name), added):
+                continue
+            for i in idxs:
+                if rows[i].get("port"):
+                    continue
+                if rows[i].get("port") is not False:
+                    # A failed triage decision remains unresolved until triage
+                    # succeeds; dependency mechanics cannot invent a decision.
+                    continue
+                rows[i]["port"] = True
+                rows[i]["category"] = "fix"
+                rows[i]["reason"] = (rows[i].get("reason") or "") + (
+                    " | 被 hunk %d 依赖（%s）" % (r["hunk"], name))
+                rows[i]["needs_semantic_mapping"] = True
+                rows[i]["review_required"] = False
+                rows[i]["closure_symbols"] = []
+                rows[i]["review_reason"] = ""
+                rows[i]["triage_state"] = "port_required"
+                changed = True
+
+    by_sym = {}
+    for i, s in enumerate(summaries):
+        sym = (s.get("symbol_inferred") or s.get("symbol") or "").strip()
+        if sym:
+            by_sym.setdefault(sym, []).append(i)
+    for sym, idxs in by_sym.items():
+        if not any(rows[i].get("port") for i in idxs):
+            continue
+        for i in idxs:
+            if rows[i].get("port"):
+                continue
+            if rows[i].get("port") is not False:
+                # An unresolved triage decision must stay unresolved; closure
+                # cannot manufacture a decision from symbol-name co-occurrence.
+                continue
+            already = rows[i].get("closure_symbols") or []
+            if sym in already:
+                continue
+            rows[i]["review_required"] = True
+            rows[i]["triage_state"] = "review_only_closure"
+            rows[i]["closure_symbols"] = sorted(set(already) | {sym})
+            rows[i]["review_reason"] = (
+                "符号闭包复核：%s 同链另有必须移植的 hunk；本 hunk 不自动移植"
+                % sym
+            )
+            changed = True
+    return changed
 
 
 def main():
@@ -189,13 +308,12 @@ def main():
     repo = sys.argv[6] if len(sys.argv) > 6 else ""
     target_ref = sys.argv[7] if len(sys.argv) > 7 else ""
     key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("LLM_KEY", "")
-    post_only = os.environ.get("TRIAGE_POST_ONLY") == "1"
-    if not key and not post_only:
+    if not key:
         sys.exit("缺 DEEPSEEK_API_KEY（兼容 LLM_KEY）")
 
-    text = Path(patch_path).read_text(encoding="utf-8", errors="replace")
+    text = open(patch_path, encoding="utf-8", errors="replace").read()
     _, hunks = split_patch_indexed(text, True)
-    summaries = json.loads(Path(summ_path).read_text(encoding="utf-8"))
+    summaries = json.load(open(summ_path, encoding="utf-8"))
     assert len(summaries) == len(hunks)
 
     failed_summaries = [int(s.get("hunk", i)) for i, s in enumerate(summaries)
@@ -206,74 +324,51 @@ def main():
         sys.exit("TRIAGE_INFRA_FAILURE: upstream summary failed for hunks %s (limit=%d)" %
                  (failed_summaries[:20], summary_failure_limit))
 
-    rows = json.loads(Path(out_path).read_text(encoding="utf-8")) if post_only else []
-    cached_reviews = None
+    post_only = os.environ.get("TRIAGE_POST_ONLY") == "1"
+    rows = json.load(open(out_path, encoding="utf-8")) if post_only else []
     if post_only:
         print("post-only：复用已有 LLM 判断，只跑后处理")
-        from tools.hunk_dependencies import attach_reviews
-        attach_reviews(summaries, hunks, rows)
-        if all("dependency_review" in r for r in rows):
-            cached_reviews = {r["hunk"]: r["dependency_review"] for r in rows}
     for r, h in ([] if post_only else zip(summaries, hunks)):
         prompt = TPL.format(
             desc=desc, file=h["file"], summary=r.get("summary", ""),
             kind=r.get("kind", ""), symbol=r.get("symbol") or "-",
             enclosing=r.get("det_enclosing") or r.get("enclosing") or "-",
-            contract=json.dumps(r.get("semantic_contract", {}), ensure_ascii=False),
-            structure=json.dumps(r.get("source_structure", {}), ensure_ascii=False),
-            diff=h["text"],
+            diff=h["text"][:4000],
         )
         obj = None
         for attempt in range(3):
             try:
-                obj = validate_decision(call(key, model, prompt))
-                break
-            except RuntimeError as e:
-                # Transport/client retries have already been exhausted. Do not
-                # repeat a failed account/request across every remaining hunk.
-                obj = {"port": None, "category": "unknown", "reason": str(e)}
-                break
-            except (ValueError, TypeError, KeyError, AttributeError, TimeoutError) as e:
+                obj = parse_json(call(key, model, prompt))
+                if obj and "port" in obj:
+                    break
+            except (urllib.error.URLError, TimeoutError) as e:
                 print("  retry %d: %s" % (attempt + 1, e), file=sys.stderr)
                 time.sleep(3)
-        if obj is None:
+        if not obj or "port" not in obj:
             obj = {"port": None, "category": "unknown", "reason": "parse failed"}
         obj["hunk"] = r["hunk"]
         obj["file"] = h["file"]
         rows.append(obj)
         print("  %2d %-5s %-10s %s" % (
-            obj["hunk"], "PORT" if obj["port"] is True else "skip" if obj["port"] is False else "FAIL",
+            obj["hunk"], "PORT" if obj["port"] else "skip",
             obj.get("category", ""), (obj.get("reason") or "")[:50]))
-        if obj["port"] is None:
-            Path(out_path).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-            sys.exit("TRIAGE_INFRA_FAILURE: unresolved hunk %d" % obj["hunk"])
 
-    # Save initial decisions even if dependency review fails; no unknown decision
-    # can silently become a skip or be hidden by closure.
-    for row in rows:
-        if "initial_decision" in row:
-            row.update(row["initial_decision"])
-        if not post_only:
-            row["dependency_status"] = "pending"
-    Path(out_path).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    failed = [r["hunk"] for r in rows if type(r.get("port")) is not bool]
-    if failed:
-        sys.exit("TRIAGE_INFRA_FAILURE: unresolved hunks %s" % failed)
-    if post_only:
-        reviews = cached_reviews
-    else:
-        reviews = review_dependencies(rows, hunks, summaries,
-            lambda prompt: call(key, model, prompt, dependency=True),
-            retries=max(0, int(os.environ.get("TRIAGE_DEPENDENCY_RETRIES", "1"))))
-    postprocess(rows, hunks, summaries, repo, target_ref, reviews)
+    if repo and target_ref:
+        postprocess(rows, hunks, summaries, repo, target_ref)
 
-    Path(out_path).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    json.dump(rows, open(out_path, "w", encoding="utf-8", newline="\n"),
+              ensure_ascii=False, indent=2)
     n_port = sum(1 for x in rows if x.get("port") is True)
     n_skip = sum(1 for x in rows if x.get("port") is False)
-    n_review = sum(1 for x in rows if x.get("port") is False and x.get("review_required"))
-    n_fail = sum(1 for x in rows if type(x.get("port")) is not bool)
+    n_review = sum(1 for x in rows
+                   if x.get("port") is False and x.get("review_required") is True)
+    n_fail = sum(1 for x in rows
+                 if not (x.get("port") is True or x.get("port") is False))
     print("\n合计: port=%d, skip=%d（仅复核 %d）, 失败=%d" % (
         n_port, n_skip, n_review, n_fail))
+    # 失败不能被当成 skip：超过 10%（至少 2 个）就判为基础设施故障
+    if n_fail > max(2, len(rows) // 10):
+        sys.exit("TRIAGE_INFRA_FAILURE: %d/%d hunks 调用失败" % (n_fail, len(rows)))
 
 
 if __name__ == "__main__":

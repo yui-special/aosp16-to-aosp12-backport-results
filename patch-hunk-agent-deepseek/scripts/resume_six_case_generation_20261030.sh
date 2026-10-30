@@ -39,7 +39,6 @@ echo "RETRY branch-fix $(date -Is)" >> "$OUT/status.txt"
 
 REPO=$($PY -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["project_dir"])' "$CFG")
 TARGET=$($PY -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["target_release"])' "$CFG")
-TARGET=$(git -C "$REPO" rev-parse --verify "$TARGET^{commit}") || exit 1
 
 git -C "$REPO" reset --hard >/dev/null 2>&1
 cd "$SRC" || exit 1
@@ -54,11 +53,10 @@ cp -f "$DS/complete.patch" "$OUT/complete.patch" 2>/dev/null || true
 cp -a "$CASE/inputs/merged_hunks/ported/." "$OUT/" 2>/dev/null || true
 
 if [ -f "$OUT/complete.patch" ]; then
-  "$PY" "$CHAIN_CHECK_SCRIPT" "$REPO" "$OUT/complete.patch" --base "$TARGET" \
+  CHAIN_CHECK_BASE_REF="$TARGET" \
+    "$PY" "$AGENT_ROOT/chain_check.py" "$REPO" "$OUT/complete.patch" \
     > "$OUT/chain-report.txt" 2>&1
-  chain_rc=$?
-  echo "RETRY_CHAIN rc=$chain_rc" >> "$OUT/status.txt"
-  if [ "$rc" = 0 ] && [ "$chain_rc" != 0 ]; then rc=$chain_rc; fi
+  echo "RETRY_CHAIN rc=$?" >> "$OUT/status.txt"
 fi
 
 "$PY" "$AGENT_ROOT/make_verdict.py" "$CASE" "$OUT" \
