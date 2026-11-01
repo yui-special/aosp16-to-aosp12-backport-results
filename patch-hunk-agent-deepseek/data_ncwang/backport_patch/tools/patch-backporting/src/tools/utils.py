@@ -540,6 +540,7 @@ def dump_merged_hunks(merged, out_dir: str):
                 "why": g.get("why", ""),
                 "files": g["files"],
                 "hints": g.get("hints", ""),
+                "target_symbols": g.get("target_symbols", []),
                 "mapping_status": g.get("mapping_status", []),
                 "strict_requires_patch": bool(g.get("strict_requires_patch", False)),
             }
@@ -573,6 +574,14 @@ def dump_merged_hunks(merged, out_dir: str):
         os.path.join(orig_dir, "index.json"), "w", encoding="utf-8", newline="\n"
     ) as f:
         json.dump(index, f, ensure_ascii=False, indent=2)
+    # Only remove obsolete files owned by this exporter. Keep custom inputs and
+    # previous ported results; the index defines the current input set.
+    current_files = {item["file"] for item in index}
+    for name in os.listdir(orig_dir):
+        path = os.path.join(orig_dir, name)
+        if (re.fullmatch(r"merged-hunk-\d+\.patch", name)
+                and name not in current_files and os.path.isfile(path)):
+            os.remove(path)
     logger.info(
         "Merged hunks dumped to %s (%d merged hunk(s))" % (orig_dir, len(merged))
     )
@@ -583,8 +592,8 @@ def load_merged_hunk_files(dir_path: str, index_name: str = "index.json"):
     """
     直接把「已经合并好的」merged hunk 当作输入读进来（不再现场从 patch 合并）。
 
-    目录里应有若干 `*.patch`（每个文件 = 一组 merged hunk，按文件名排序依次处理），
-    可选一个 `index.json`（dump_merged_hunks 写出的索引，带 gid/name/concern/why）。
+    存在 `index.json` 时，严格按索引的文件列表和顺序读取，包括空列表。
+    仅无索引的旧输入目录按 `*.patch` 文件名排序读取。
     这样只要替换/改写这些 patch 文件，就等于改了 PortGPT 的输入。
 
     Args:
@@ -595,19 +604,26 @@ def load_merged_hunk_files(dir_path: str, index_name: str = "index.json"):
         list[dict]: 与 group_patch() 的 merged 结构一致，额外带 source_file 字段。
     """
     if not dir_path or not os.path.isdir(dir_path):
-        return []
-
-    files = sorted(f for f in os.listdir(dir_path) if f.endswith(".patch"))
+        raise FileNotFoundError("merged hunk input directory does not exist: %s" % dir_path)
 
     meta = {}
     idx_path = os.path.join(dir_path, index_name)
-    if os.path.isfile(idx_path):
-        try:
-            with open(idx_path, "r", encoding="utf-8") as f:
-                for item in json.load(f):
-                    meta[item.get("file", "")] = item
-        except Exception as e:  # noqa: BLE001
-            logger.warning("读取 %s 失败，忽略其元信息: %s" % (idx_path, e))
+    if os.path.exists(idx_path):
+        with open(idx_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+        if not isinstance(index, list):
+            raise ValueError("merged hunk index must be a list: %s" % idx_path)
+        files = []
+        for item in index:
+            name = item.get("file") if isinstance(item, dict) else None
+            if (not isinstance(name, str) or os.path.basename(name) != name
+                    or not name.endswith(".patch") or name in meta):
+                raise ValueError("invalid or duplicate merged hunk filename in %s: %r" %
+                                 (idx_path, name))
+            files.append(name)
+            meta[name] = item
+    else:
+        files = sorted(f for f in os.listdir(dir_path) if f.endswith(".patch"))
 
     merged = []
     for i, fn in enumerate(files):
@@ -628,6 +644,7 @@ def load_merged_hunk_files(dir_path: str, index_name: str = "index.json"):
                 "why": m.get("why", ""),
                 "files": m.get("files", patch_files),
                 "hints": m.get("hints", ""),
+                "target_symbols": m.get("target_symbols", []),
                 "mapping_status": m.get("mapping_status", []),
                 "strict_requires_patch": bool(m.get("strict_requires_patch", False)),
                 "text": text,
@@ -771,7 +788,7 @@ def hunk_coverage_report(member_hunks, produced_patch_text: str, need_not_ported
         elif need_not_ported:
             covered, reason = True, "need_not_ported"
         elif not distinctive:
-            covered, reason = True, "no_distinctive_identifier"
+            covered, reason = False, "unconfirmed_no_distinctive_identifier"
         elif hit:
             covered, reason = True, "identifier_found"
         elif line_similarity_covered(h["text"]):
@@ -827,7 +844,7 @@ def group_patch(patch: str, groups_spec=None, flag_commit: bool = True):
         tuple[str, list[dict]]: (message, merged)
             merged: [{"gid":..., "name":..., "hunks":[原始 hunk 编号...],
                       "concern":..., "why":..., "files":[...], "text": 合并后的 patch 文本}, ...]
-                    按组内最小 hunk 编号排序，保证输出顺序稳定。
+                    保留分组规格的执行顺序；未覆盖的独立 hunk 按原始顺序追加。
     """
     message, hunks = split_patch_indexed(patch, flag_commit)
     if not hunks:
@@ -894,8 +911,7 @@ def group_patch(patch: str, groups_spec=None, flag_commit: bool = True):
             assign[h["idx"]] = len(specs) - 1
 
     merged = []
-    for gi in sorted(range(len(specs)), key=lambda k: min(specs[k]["members"])):
-        s = specs[gi]
+    for s in specs:
         members = sorted(s["members"])
         text = "\n".join(by_idx[i]["text"] for i in members) + "\n"
         merged.append(

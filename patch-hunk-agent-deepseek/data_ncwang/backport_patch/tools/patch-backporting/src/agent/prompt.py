@@ -5,7 +5,9 @@ Your TASK is to backport a patch fixing a vuln from a newer(release) version of 
 In patch backports, patches are often not used directly due to changes in CONTEXT or changes in patch logic. For lines that start with `-` and ` ` (space), you need to copy the original source code behind it.
 Your OBJECTIVES is to identify changes in context and changes in code logic in the vicinity of the patch. Generate a patch for the old version that matches its code based on the patch in the new version.
 
-You have 5 tools: `viewcode` `locate_symbol` `git_history` `git_show` and `validate`
+You have 6 tools: `viewcode`, `locate_symbol`, `find_references`, `git_history`, `git_show` and `validate`.
+`find_references(ref, symbol)` returns parsed declarations and call candidates, including target-only callers.
+Names and arity do not prove type or overload binding. Preserve explicit parse gaps as unknowns.
 
 - `viewcode` allows you to view a file in the codebase of a ref. When you can't find the relevant code in the continuous viewcode, you should consider whether the hunk doesn't need a backport.
 0. ref: the commit hash of the ref you want to view the file from.
@@ -78,7 +80,7 @@ To make it convenient for you to view the patch similar location code, the follo
 
 Your workflow should be:
 1. Review the patch of the newer version and similar code blocks of the olded version. 
-2. Use `git_history` to check code change history. This information helps you to see where or if(`need not ported`) the current snippet exists in an older version. Since similar code blocks are text-based comparisons, it may not be possible to accurately determine the location of modifications.  
+2. Use `git_history` only if supplied source facts leave the code origin or mapping unresolved. This information helps you to see where or if(`need not ported`) the current snippet exists in an older version. Since similar code blocks are text-based comparisons, it may not be possible to accurately determine the location of modifications.
 2.1. For change history, it just helps you locate the code blocks and does not require patches in them as part of the migration.
 2.2. If there is only a simple modification it means that the code block has not changed and you just need to adapt the context in the corresponding position. (I.e. the patch just needs to adapt the context of the beginning of the space.)
 2.3. If the change code block was initially modified to be  `+`, you can choose to execute the contents of 3. to determine the source of this code.
@@ -90,7 +92,9 @@ Your workflow should be:
 6. Based on the code given by `viewcode` and change history, craft a patch that can fix the vuln.
 7. Use `validate` to test the FULL patch on the older version to make sure it can be applied without any conflicts. If you don't think the hunk needs to be ported, you can put `need not ported` in the `patch` parameter of `validate`.
 
-You must think step by step according to the workflow and use the tools provided to analyze the patch and the codebase to craft a patch for the target release.
+Use supplied facts before requesting more context. Each further query should answer a specific unresolved question.
+Once the necessary definitions, callsites and branches are known, submit the complete candidate to validate.
+If queries stop adding facts, identify the exact missing information; do not repeat broad reads or claim a hunk is unnecessary.
 
 The line number can be inaccurate, BUT The context lines MUST MUST be present in the old codebase.There should be no missing context lines or extra context lines which are not present in the old codebase.
 

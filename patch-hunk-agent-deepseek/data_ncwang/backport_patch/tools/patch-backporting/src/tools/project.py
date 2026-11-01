@@ -8,14 +8,21 @@ import time
 from types import SimpleNamespace
 from typing import List, Tuple
 
-import Levenshtein
 from git import Repo
 from git.exc import GitCommandError
 from langchain_core.tools import tool
 
 import tools.utils as utils
 from tools.logger import logger
-from tools.source_structure import SymbolIndex
+from tools.source_structure import SymbolIndex, normalize_symbol
+from tools.source_checks import inspect_worktree_patch, candidate_api_inventory
+
+
+class FinalValidationUnavailable(RuntimeError):
+    """An unavailable reviewer/checker is not itself evidence of a code defect."""
+    def __init__(self, message, repair_feedback=''):
+        super().__init__(message)
+        self.repair_feedback = repair_feedback
 
 
 class Project:
@@ -42,8 +49,9 @@ class Project:
         self.validated_patch_checkpoints = []
         self.full_patch_base = None
         self.validated_complete_patch = None
-        self.symbol_map = {}
         self.source_index = SymbolIndex(self.dir)
+        self.query_progress = None
+        self.query_stale_limit = getattr(data, "query_stale_limit", 4)
         self.now_hunk = ""
         self.now_hunk_num = 0
         self.hunk_log_info = {}
@@ -51,6 +59,8 @@ class Project:
         self.last_context = []
         self.no_change_evidence = None
         self.final_artifact_check = None
+        self.final_validation_unavailable = False
+        self.final_repair_required = False
         # [P0] 文件"搬移推断"的递归深度（只允许一层，避免 5^k 重试爆炸）
         self._move_depth = 0
 
@@ -121,10 +131,6 @@ class Project:
         except:
             return "Error commit id, please check if the commit id is correct."
 
-    def _prepare(self, ref: str) -> None:
-        """Build a Tree-sitter index from this revision without changing the checkout."""
-        self.symbol_map[ref] = self.source_index.prepare(ref)
-
     def _viewcode(self, ref: str, path: str, startline: int, endline: int) -> str:
         """
         View a file from a specific ref of the target repository. Lines between startline and endline are shown.
@@ -139,37 +145,23 @@ class Project:
             str: The content of the file between the specified startline and endline.
                  If the file doesn't exist in the commit, a message indicating that is returned.
         """
+        sha = self.repo.commit(ref).hexsha
+        query = dict(ref=sha, path=path, startline=startline, endline=endline)
         try:
-            file = self.repo.tree(ref) / path
-        except:
-            return "This file doesn't exist in this commit."
-        content = file.data_stream.read().decode("utf-8", errors="ignore")
-        lines = content.split("\n")
-        ret = []
-        if not lines:
-            return "This file is empty.\n"
-        if startline > endline:
-            startline, endline = endline, startline
-        startline = max(1, startline)
-        if startline > len(lines):
-            ret.append(
-                f"This file only has {len(lines)} lines. Showing full file.\n"
-            )
-            startline = 1
-            endline = len(lines)
-        elif endline > len(lines):
-            endline = len(lines)
-            ret.append(
-                f"This file only has {len(lines)} lines. Here are lines {startline} through {endline}.\n"
-            )
-        else:
-            ret.append(f"Here are lines {startline} through {endline}.\n")
-        for i in range(startline - 1, endline):
-            ret.append(lines[i])
-        return (
-            "\n".join(ret)
-            + "\nBased on the previous information, think carefully do you see the target code? You may want to keep checking if you don't.\n"
-        )
+            file = self.repo.tree(sha) / path
+        except KeyError:
+            return _read_result(self, 'viewcode', query, [(sha, path, 'missing')],
+                                "This file doesn't exist in this commit.")
+        lines = file.data_stream.read().decode('utf-8', errors='replace').splitlines()
+        startline, endline = max(1, min(startline, endline)), max(startline, endline)
+        if startline > len(lines) or endline < 1:
+            return _read_result(self, 'viewcode', query, [(sha, path, 'line_count', len(lines))],
+                                'Requested range is outside the file (%d lines).' % len(lines))
+        endline = min(endline, len(lines))
+        output = '%s:%s lines %d-%d\n' % (sha, path, startline, endline)
+        output += '\n'.join('%d: %s' % (i + 1, lines[i]) for i in range(startline - 1, endline))
+        return _read_result(self, 'viewcode', query,
+                            [(sha, path, i) for i in range(startline, endline + 1)], output)
 
     def _locate_symbol(self, ref: str, symbol: str) -> List[Tuple[str, int]] | None:
         """
@@ -183,33 +175,6 @@ class Project:
             List[Tuple[str, int]] | None: File path and code lines.
         """
         return self.source_index.locate(ref, symbol)
-
-    def _locate_similar_symbol(
-        self, ref: str, symbol: str
-    ) -> List[Tuple[str, int]] | None:
-        """
-        Locate the most similar symbol with llm need in a specific ref of the target repository.
-
-        Args:
-            ref (str): The reference of the target repository.
-            symbol (str): The symbol to locates.
-
-        Returns:
-            List[Tuple[str, int]] : File path and code lines for the most similar symbol.
-        """
-        self._prepare(ref)
-        symbols = self.symbol_map[ref]
-        most_similar = None
-        smallest_distance = float("inf")
-
-        for symbol_i in symbols.keys():
-            # 计算 Levenshtein 距离
-            distance = Levenshtein.distance(symbol, symbol_i)
-            if distance < smallest_distance:
-                smallest_distance = distance
-                most_similar = symbol_i
-
-        return symbols.get(most_similar), most_similar
 
     def _git_history(self) -> str:
         """
@@ -528,6 +493,7 @@ class Project:
 
         """
         ret = ""
+        self.round_succeeded = False
         self._checkout(ref)
         self.repo.git.reset("--hard")
         if revise_context:
@@ -539,10 +505,7 @@ class Project:
         logger.debug(f"Applying patch {f.name}")
         try:
             self.repo.git.apply([f.name], v=True)
-            ret += "Patch applied successfully\n"
-            self.succeeded_patches.append(revised_patch)
-            self.round_succeeded = True
-        except Exception as e:
+        except GitCommandError as e:
             if "No such file" in e.stderr:
                 logger.debug(f"File not found")
                 find_ret = self._apply_file_move_handling(ref, revised_patch)
@@ -557,6 +520,32 @@ class Project:
                 ret += block
                 ret += "Besides, here is detailed info about how the context differs between the patch and the old version.\n"
                 ret += differ
+        else:
+            try:
+                facts = inspect_worktree_patch(self.dir, self.repo.head.commit.hexsha, revised_patch)
+                apis = (candidate_api_inventory(self.source_index, self.repo.head.commit.hexsha,
+                                               revised_patch, facts['signature_changes'])
+                        if facts['signature_changes'] and not facts['errors'] else [])
+            except Exception:
+                self.repo.git.apply("--reverse", f.name)
+                raise
+            if facts["errors"]:
+                self.repo.git.apply("--reverse", f.name)
+                ret += "STRUCTURAL_VALIDATION_FAILED: " + json.dumps(facts, ensure_ascii=False) + "\n"
+            else:
+                ret += "Patch applied successfully\n"
+                if facts["files"]:
+                    ret += "SOURCE_FACTS (syntax only, not a semantic verdict): " + json.dumps(facts, ensure_ascii=False) + "\n"
+                if facts['signature_changes']:
+                    ret += ('CANDIDATE_API_FACTS: check these call candidates against the changed '
+                            'signatures; parsing does not prove type binding.\n' +
+                            json.dumps({'signature_changes': facts['signature_changes'], 'apis': apis,
+                                        'patch_sha256': hashlib.sha256(revised_patch.encode()).hexdigest()},
+                                       ensure_ascii=False) + '\n')
+                self.succeeded_patches.append(revised_patch)
+                self.round_succeeded = True
+        finally:
+            os.unlink(f.name)
 
         # 累积模式：成功打上的结果要留在工作树里，供 commit_group 直接提交；
         # 失败时 git apply 是原子的（不会留下半成品），照旧还原。
@@ -613,18 +602,18 @@ class Project:
         finally:
             os.unlink(patch_path)
 
-        if self.final_artifact_check is not None:
-            failure = self.final_artifact_check(complete_patch)
-            if failure:
-                return failure + '\nSubmit a complete revised patch addressing these obligations.\n'
+        facts = inspect_worktree_patch(self.dir, base, blob)
+        if facts["errors"]:
+            self.repo.git.reset("--hard")
+            return "STRUCTURAL_VALIDATION_FAILED: " + json.dumps(facts, ensure_ascii=False) + "\n"
+        if facts["files"]:
+            ret += "SOURCE_FACTS (syntax only, not a semantic verdict): " + json.dumps(facts, ensure_ascii=False) + "\n"
 
         # compile the patch
         logger.debug("Start compile the patched source code")
         if not os.path.exists(os.path.join(self.dir, "build.sh")):
             logger.debug("No build.sh file found.")
-            ret += "The patched source code could be COMPILED successfully! I really thank you for your great efforts.\n"
-            self.compile_succeeded = True
-            return ret
+            return 'BUILD_UNAVAILABLE: build.sh is missing; compilation has not run.\n'
 
         # build_process = subprocess.Popen(
         #     ["/bin/bash", "build.sh"],
@@ -658,7 +647,9 @@ class Project:
             # stdout 和 stderr 都要：实测出现过 build.sh 失败但 stdout 为空、
             # 错误信息全在 stderr 的情况，模型收到空错误只能瞎猜。
             compile_stdout, compile_stderr = build_process.communicate(timeout=60 * 60)
-            compile_result = compile_stdout
+            compile_result = compile_stdout or ''
+            if (compile_stderr or '').strip():
+                compile_result += '\n[stderr]\n' + compile_stderr
         except subprocess.TimeoutExpired:
             build_process.kill()
             ret += f"The compilation process of the patched source code is timeout. "
@@ -668,7 +659,6 @@ class Project:
             )
             for patch in self.succeeded_patches:
                 logger.info(patch)
-            exit(0)
             return ret
 
         if build_process.returncode != 0:
@@ -829,15 +819,34 @@ class Project:
             self.compile_succeeded = False
             self.testcase_succeeded = False
             self.poc_succeeded = False
+            self.final_validation_unavailable = False
+            self.final_repair_required = False
             ret = self._compile_patch(self.full_patch_base or ref, patch)
             if self.compile_succeeded and not self.testcase_succeeded:
                 ret += self._run_testcase()
+            self.final_repair_required = not (self.compile_succeeded and self.testcase_succeeded)
+            # Collect build/test evidence even when semantic review is unavailable.
+            # Acceptance and validated checkpoints still require both kinds of evidence.
+            if self.final_artifact_check is not None:
+                try:
+                    failure = self.final_artifact_check(patch)
+                except FinalValidationUnavailable as exc:
+                    self.final_validation_unavailable = True
+                    self.final_repair_required |= bool(exc.repair_feedback)
+                    return (ret + '\nFINAL_VALIDATION_UNAVAILABLE: ' + str(exc)
+                            + '\nThis is not a code defect. Do not rewrite code to fix review availability. '
+                            'Only address concrete compilation/test/API/semantic findings below or above. '
+                            'Final acceptance remains pending.\n' + exc.repair_feedback)
+                if failure:
+                    self.final_repair_required = True
+                    return ret + '\n' + failure + '\nSubmit a complete revised patch addressing these findings.\n'
             if (
                 self.compile_succeeded
                 and self.testcase_succeeded
                 and not self.poc_succeeded
             ):
                 ret += self._run_poc(patch)
+            self.final_repair_required = not self.poc_succeeded
             return ret
         else:
             if patch.strip() == "need not ported":
@@ -870,27 +879,40 @@ class Project:
         )
 
 
+def _read_result(project, tool, query, facts, output):
+    progress = getattr(project, 'query_progress', None)
+    return progress.observe(tool, query, facts, output) if progress is not None else output
+
+
+def create_find_references_tool(project: Project):
+    @tool
+    def find_references(ref: str, symbol: str) -> str:
+        """List parsed definitions and ALL same-name call candidates at a fixed Git ref.
+        Includes receiver, arguments, scope and location. Candidates are not type-bound;
+        inspect the actual receiver/overload before deciding which calls need changing.
+        """
+        result = project.source_index.inspect(ref, symbol)
+        return _read_result(project, 'find_references', dict(ref=result['ref'], symbol=symbol),
+                            [(result['ref'], result)], json.dumps(result, ensure_ascii=False))
+
+    return find_references
+
+
 def creat_locate_symbol_tool(project: Project):
     @tool
     def locate_symbol(ref: str, symbol: str) -> str:
         """
         Locate a symbol in a specific ref of the target repository.
         """
-        res = project._locate_symbol(ref, symbol)
-        if res is not None:
-            return "\n".join([f"{file}:{line}" for file, line in res])
-        else:
-            res, most_similar = project._locate_similar_symbol(ref, symbol)
-            ret = (f"No parsed definition of {symbol} was found at this ref. "
-                   "Unsupported syntax/languages may be missing from the index; "
-                   "this is not proof that the implementation is absent.\n")
-            if not res:
-                return ret + "No similar parsed definition was found. Inspect the source paths directly.\n"
-            ret += f"But here is a symbol similar to it. It's `{most_similar}`.\n"
-            ret += f"The file where this symbol is located is: \n"
-            ret += "\n".join([f"{file}:{line}" for file, line in res])
-            ret += f"\nPlease be careful to check that this symbol indicates the same thing as the previous symbol.\n"
-            return ret
+        result = project.source_index.inspect(ref, symbol)
+        output = {k: result[k] for k in ('ref', 'symbol', 'definitions', 'diagnostics')}
+        if not result['definitions']:
+            output['status'] = 'No exact parsed declaration; parse gaps do not prove absence'
+            name = normalize_symbol(symbol).rsplit('.', 1)[-1]
+            if name != normalize_symbol(symbol):
+                output['other_owner_candidates'] = project.source_index.inspect(ref, name)['definitions']
+        return _read_result(project, 'locate_symbol', dict(ref=result['ref'], symbol=symbol),
+                            [(result['ref'], output)], json.dumps(output, ensure_ascii=False))
 
     return locate_symbol
 
@@ -913,6 +935,8 @@ def create_validate_tool(project: Project):
         Validate a patch on a target ref. For "need not ported", evidence must explain
         each hunk using target files/symbols; the decision remains pending final review.
         """
+        if getattr(project, 'query_progress', None):
+            project.query_progress.validated()
         ret = project._validate(ref, patch, evidence)
         if project.poc_succeeded:
             project.persist_validated_patch(patch, ref)
@@ -927,7 +951,8 @@ def create_git_history_tool(project: Project):
         """
         get history for lines which relate to patch hunk.
         """
-        return project._git_history()
+        result = project._git_history()
+        return _read_result(project, 'git_history', {}, [('history', result)], result)
 
     return git_history
 
@@ -938,6 +963,7 @@ def create_git_show_tool(project: Project):
         """
         show change log for a specific ref
         """
-        return project._git_show()
+        result = project._git_show()
+        return _read_result(project, 'git_show', {}, [('git_show', result)], result)
 
     return git_show

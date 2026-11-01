@@ -24,7 +24,9 @@ from agent.prompt import (
 )
 from tools.logger import logger
 from tools.group_report import GroupComparison
-from tools.project import Project
+from tools.project import Project, FinalValidationUnavailable, create_find_references_tool
+from tools.source_checks import ApiCatalog
+from tools.porting_context import ChangeLedger, QueryProgress, execution_result
 from agent.coverage import CoverageReviewer
 from tools.utils import (
     dump_merged_hunks,
@@ -95,8 +97,9 @@ def build_hunk_executor(
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ]
     )
+    project.query_progress = QueryProgress(project.query_stale_limit)
     viewcode, locate_symbol, validate, git_history, git_show = project.get_tools()
-    tools = [viewcode, locate_symbol, validate, git_history, git_show]
+    tools = [viewcode, locate_symbol, validate, git_history, git_show, create_find_references_tool(project)]
     agent = create_tool_calling_agent(llm, tools, prompt)
     agent_executor = AgentExecutor(
         agent=agent, tools=tools, verbose=debug_mode, max_iterations=max_iterations
@@ -212,12 +215,12 @@ def evaluate_global_artifact(
         accepted_need_not_ported = {m['idx'] for m in global_cov['members']
                                    if m.get('status') == 'not_applicable' and m['covered']}
 
-    chain_script = os.environ.get("CHAIN_CHECK_SCRIPT", "/data/ncwang/chain_check.py")
+    chain_script = os.environ.get("CHAIN_CHECK_SCRIPT") or os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '../../../../../chain_check.py'))
     chain_path = os.path.join(ported_dir, "global-api-chain.txt")
-    if cumulative:
+    if cumulative and global_cov.get('candidate_tree'):
         chain_env = os.environ.copy()
-        if global_cov.get('candidate_tree'):
-            chain_env['CHAIN_CHECK_REF'] = global_cov['candidate_tree']
+        chain_env['CHAIN_CHECK_REF'] = global_cov['candidate_tree']
         chain_proc = subprocess.run(
             [sys.executable, chain_script, project.dir, complete_path],
             capture_output=True,
@@ -228,8 +231,8 @@ def evaluate_global_artifact(
         chain_rc = chain_proc.returncode
         chain_report = (chain_proc.stdout or "") + (chain_proc.stderr or "")
     else:
-        chain_rc = 1
-        chain_report = "API chain check requires cumulative mode.\n"
+        chain_rc = 2
+        chain_report = "API chain check requires a fixed candidate tree in cumulative mode; no working-tree fallback.\n"
     with open(chain_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(chain_report)
 
@@ -315,7 +318,7 @@ def commit_group(project, patches, gpos, group):
         if not staged:
             repo.git.reset("--hard")
             logger.debug("累积: 第 %d 组没有产出，分支不前进" % gpos)
-            return
+            return True
         # 显式带身份：新仓库没配 user.name/user.email 时，git commit 会直接失败
         # （实测 CVE-2026-0045 / 46054 的 linux_510、platform_system_bt 都是这样）
         repo.git.update_environment(
@@ -332,8 +335,10 @@ def commit_group(project, patches, gpos, group):
             "累积: 第 %d 组已提交（%s），分支前进到 %s"
             % (gpos, staged.replace("\n", ", "), repo.git.rev_parse("HEAD")[:12])
         )
+        return True
     except Exception as e:  # noqa: BLE001  -- 累积失败不能弄死整轮
         logger.error("累积提交失败（第 %d 组）: %s: %s" % (gpos, type(e).__name__, e))
+        return False
 
 
 def describe_group(group):
@@ -420,24 +425,17 @@ def do_backport(
     # 输入有两种来源（优先用「已经合并好的文件」）：
     #   1) merged_hunks 目录里的 *.patch —— 每个文件就是一组已经合并好的 hunk，
     #      轮到谁就把谁的内容作为该 session 的输入（可以手工改写这些文件）；
-    #   2) 否则回退到「分组文件 + 现场合并」（hunk_groups.json -> merged hunk）。
+    #   2) 未指定目录时才使用「分组文件 + 现场合并」。空目录/空索引不触发回退。
     groups_spec = getattr(data, "hunk_groups_spec", None)
     merged_input_dir = getattr(data, "merged_hunks_input_dir", "")
 
-    merged_hunks = []
     if merged_input_dir:
         merged_hunks = load_merged_hunk_files(merged_input_dir)
-        if merged_hunks:
-            logger.info(
-                "Input = %d pre-merged hunk file(s) from %s "
-                "(one file = one session input)" % (len(merged_hunks), merged_input_dir)
-            )
-        else:
-            logger.warning(
-                "目录 %s 里没有 *.patch，回退到按分组现场合并" % merged_input_dir
-            )
-
-    if not merged_hunks:
+        logger.info(
+            "Input = %d pre-merged hunk file(s) from %s "
+            "(one file = one session input)" % (len(merged_hunks), merged_input_dir)
+        )
+    else:
         _, merged_hunks = group_patch(patch, groups_spec, True)
         if groups_spec:
             logger.info(
@@ -469,7 +467,7 @@ def do_backport(
 
     if not merged_hunks:
         logger.error(
-            "没有拿到任何 merged hunk（分组文件为空 / merged_hunks 目录里没有 *.patch），退出"
+            "输入包含 0 个移植组；不回退到原始 patch，未执行补丁验证，退出"
         )
         return
 
@@ -492,8 +490,8 @@ def do_backport(
 
     # [C] 跨组共享变更账本：后面的组能看到前面各组「实际产出了什么」。
     # 各组会话独立；累积模式中的源码已包含前面组的提交。
-    ledger = []
-    ledger_limit = int(getattr(data, "ledger_chars", 6000) or 6000)
+    ledger = ChangeLedger(int(getattr(data, "ledger_chars", 6000)))
+    catalog = ApiCatalog(project.source_index, data.new_patch_parent, data.new_patch, all_hunks)
 
     all_groups_complete = True
     selected_hunks = set()
@@ -508,11 +506,21 @@ def do_backport(
             group["gid"],
         )
         member_hunks = [hunks_by_idx[i] for i in group["hunks"] if i in hunks_by_idx]
+        inventory = catalog.inventory(data.target_release, member_hunks, group.get("target_symbols", []))
+        with open(os.path.join(ported_dir, "merged-hunk-%02d.api-inventory.json" % gpos),
+                  "w", encoding="utf-8") as handle:
+            json.dump(inventory, handle, ensure_ascii=False, indent=2)
+        api_note = ("\n[TARGET API FACTS]\nThese are program-collected declarations and call candidates, "
+                    "including target-only callers absent from the upstream patch. Check every candidate "
+                    "when changing a signature; same name/arity does not prove receiver or overload identity. "
+                    "Parse gaps are unknowns. Use find_references for renamed target APIs.\n" +
+                    json.dumps(inventory, ensure_ascii=False))
         status_path = os.path.join(ported_dir, "merged-hunk-%02d.status.json" % gpos)
         project.round_succeeded = False
         project.context_mismatch_times = 0
         project.no_change_evidence = None
         n_before = len(project.succeeded_patches)
+        executions = []
         directly_applied = False
         strict_requires_patch = bool(group.get("strict_requires_patch", False))
         any_strict_requires_patch = any_strict_requires_patch or strict_requires_patch
@@ -526,7 +534,8 @@ def do_backport(
                 logger.warning("Cannot read group %d base for comparison: %s", gpos, exc)
 
         def produced_patches():
-            return list(project.succeeded_patches[n_before:])
+            candidates = project.succeeded_patches[n_before:]
+            return candidates[-1:]
 
         def report_group():
             if cumulative:
@@ -551,6 +560,9 @@ def do_backport(
             """把本组产出的 patch 存到 ported/merged-hunk-NN.patch。"""
             new_patches = produced_patches()
             if not new_patches:
+                path = os.path.join(ported_dir, "merged-hunk-%02d.patch" % gpos)
+                if os.path.isfile(path):
+                    os.unlink(path)
                 return
             with open(
                 os.path.join(ported_dir, "merged-hunk-%02d.patch" % gpos),
@@ -588,6 +600,7 @@ def do_backport(
                         "members": cov["members"],
                         "no_change_evidence": project.no_change_evidence,
                         "requires_final_semantic_review": True,
+                        "executions": executions,
                     },
                     fh,
                     ensure_ascii=False,
@@ -595,30 +608,41 @@ def do_backport(
                 )
 
         def ledger_note():
-            """把前面各组的产出摘要成一段 prompt 文本（[C] 共享变更账本）。"""
-            if not ledger:
-                logger.debug("%s ledger: 0 chars (no previous groups)" % (group_tag,))
-                return ""
-            joined = "\n".join(ledger)
-            if len(joined) > ledger_limit:
-                joined = joined[:ledger_limit] + "\n...(truncated)"
-            applied_note = (
-                "Earlier groups are already committed to your target branch. Inspect and reuse "
-                "their existing definitions; do not add them again. The ledger can include "
-                "superseded candidate revisions; the target tree is authoritative.\n"
-                if cumulative else
-                "Earlier groups are not applied to this clean checkout; their patches will "
-                "be composed at the end. Keep signatures and renamed symbols consistent.\n"
-            )
-            text = (
-                "\n[PREVIOUS CHANGES — shared change ledger]\n" + applied_note +
-                "```diff\n" + joined + "\n```\n"
-            )
-            logger.debug(
-                "%s ledger: %d chars from %d previous patch(es)"
-                % (group_tag, len(text), len(ledger))
-            )
-            return text
+            files = set(group.get('files', []))
+            files.update(d['path'] for api in inventory['apis'] for d in api['definitions'])
+            return ledger.render(files, [api['symbol'] for api in inventory['apis']], cumulative)
+
+        def finalize_group():
+            committed = True
+            if cumulative:
+                committed = commit_group(project, produced_patches(), gpos, group)
+                output = project.repo.git.diff(group_base, data.target_release) if group_base else ''
+                if not committed:
+                    project.round_succeeded = False
+                    executions.append(dict(reason='group_commit_failed', output='No accepted group commit'))
+            else:
+                patches = produced_patches()
+                output = patches[-1] if patches else ''
+            project.succeeded_patches[n_before:] = [output] if output.strip() else []
+            ledger.record(gpos, group['hunks'], group_base,
+                          project.repo.git.rev_parse(data.target_release), output)
+            save_ported()
+            return committed
+
+        def invoke_session(executor, payload):
+            project.query_progress = QueryProgress(getattr(project, 'query_stale_limit', 4))
+            result, error = None, None
+            try:
+                result = executor.invoke(payload, {"callbacks": [log_handler]})
+            except Exception as exc:  # A failed session remains visible in its group status.
+                error = exc
+                logger.error('%s session failed: %s: %s', group_tag, type(exc).__name__, exc)
+                project.round_succeeded = False
+            record = execution_result(result, project.round_succeeded, error)
+            progress = getattr(project, 'query_progress', None)
+            if progress is not None:
+                record['query_progress'] = progress.report()
+            executions.append(record)
 
         try:
             ret = project._apply_hunk(data.target_release, pp, False)
@@ -649,28 +673,19 @@ def do_backport(
                 "similar_block": similar_block,
                 "group_size": len(group["hunks"]),
                 "group_ids": group["hunks"],
-                "group_desc": describe_group(group) + ledger_note(),
+                "group_desc": describe_group(group) + api_note + ledger_note(),
             }
             dump_portgpt_summary(ported_dir, gpos, "initial", payload)
-            try:
-                executor.invoke(payload, {"callbacks": [log_handler]})
-            except Exception as e:  # noqa: BLE001  -- [P0] 会话异常不许弄死整个运行
-                logger.error(
-                    "%s 会话抛异常: %s: %s" % (group_tag, type(e).__name__, e)
-                )
-                project.round_succeeded = False
+            invoke_session(executor, payload)
             if not project.round_succeeded:
                 logger.debug(
                     f"Failed to backport the {group_tag} \n----------------------------------\n{pp}\n----------------------------------\n"
                 )
-                logger.error(f"Reach max_iterations for {group_tag}")
-                save_ported()
+                logger.error("%s: %s", group_tag, executions[-1]["reason"])
+                finalize_group()
                 # [P0] 一组失败不再终止整个运行：记录状态后继续下一组
                 save_status(check_coverage(), 0)
                 all_groups_complete = False
-                ledger.extend(produced_patches())
-                if cumulative:
-                    commit_group(project, produced_patches(), gpos, group)
                 report_group()
                 continue
 
@@ -704,18 +719,12 @@ def do_backport(
                 "similar_block": "",
                 "group_size": len(group["hunks"]),
                 "group_ids": group["hunks"],
-                "group_desc": describe_group(group) + ledger_note() + note,
+                "group_desc": describe_group(group) + api_note + ledger_note() + note,
             }
             dump_portgpt_summary(
                 ported_dir, gpos, "retry-%02d" % attempts, payload
             )
-            try:
-                executor.invoke(payload, {"callbacks": [log_handler]})
-            except Exception as e:  # noqa: BLE001  -- [P0] 重试会话异常也不许弄死整个运行
-                logger.error(
-                    "%s 重试会话抛异常: %s: %s" % (group_tag, type(e).__name__, e)
-                )
-                project.round_succeeded = False
+            invoke_session(executor, payload)
             if not project.round_succeeded:
                 # 重试没成，回滚到上一次的产出，别把已经拿到的部分丢掉
                 project.succeeded_patches.extend(previous)
@@ -725,16 +734,14 @@ def do_backport(
 
         if not cov["complete"] and strict_requires_patch and not produced_patches() and not project.no_change_evidence:
             project.round_succeeded = False
-        save_ported()
+        if not finalize_group():
+            cov = check_coverage()
         save_status(cov, attempts)
         if cov.get("need_not_ported"):
             accepted_need_not_ported.update(int(i) for i in group.get("hunks", []))
         if not cov["complete"]:
             all_groups_complete = False
-        # 本组产出记入账本，供后面的组参考
-        ledger.extend(produced_patches())
         if cumulative:
-            commit_group(project, produced_patches(), gpos, group)
             if os.environ.get("PG_COMPILE_PER_GROUP") == "1":
                 compile_group(project, data, gpos,
                               os.path.join(ported_dir, "compile-per-group.log"))
@@ -790,8 +797,8 @@ def do_backport(
         logger.warning("写完整 patch 失败: %s" % e)
 
     # ---- Global validation over the FINAL composed patch --------------------
-    # This runs once before final repair and again after the validated artifact
-    # is rebuilt, so stale pre-repair statuses cannot report a false success.
+    # Review each candidate after its build/test attempt, and again after the
+    # validated artifact is rebuilt. Review outages must not skip compilation.
     validation_base = project.repo.git.rev_parse(cum_base or data.target_release)
     review_llm = llm
     if getattr(data, 'coverage_model', None) and data.coverage_model != getattr(data, 'llm_model', None):
@@ -801,10 +808,11 @@ def do_backport(
     project.coverage_reviewer = CoverageReviewer(
         review_llm, project.dir, validation_base,
         max_iterations=getattr(data, 'coverage_review_iterations', 20),
-        retries=getattr(data, 'coverage_review_retries', 1))
+        retries=getattr(data, 'coverage_review_retries', 1),
+        artifact_dir=os.path.join(ported_dir, 'coverage-review'))
 
     def final_artifact_check(candidate):
-        # The same check protects every full-patch repair before compilation.
+        # The same check protects acceptance of every compiled repair candidate.
         with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', encoding='utf-8',
                                          errors='surrogateescape') as artifact:
             artifact.write(candidate if candidate.endswith('\n') else candidate + '\n')
@@ -812,8 +820,19 @@ def do_backport(
             complete, report = evaluate_global_artifact(
                 project, candidate, artifact.name, ported_dir, hunks_by_idx,
                 selected_hunks, accepted_need_not_ported, any_strict_requires_patch, cumulative)
-        if report['coverage']['method'] == 'semantic_review_failed':
-            raise RuntimeError('FINAL_REVIEW_UNAVAILABLE: ' + str(report['coverage'].get('error')))
+        review_failed = report['coverage']['method'] == 'semantic_review_failed'
+        chain_failed = report['api_chain_rc'] not in (0, 1)
+        if review_failed or chain_failed:
+            unavailable, findings = [], []
+            if review_failed:
+                unavailable.append('Semantic review: ' + str(report['coverage'].get('error')))
+            elif not report['coverage']['complete']:
+                findings.append('SEMANTIC_VALIDATION_FAILED: ' + json.dumps(report['coverage'], ensure_ascii=False))
+            if chain_failed:
+                unavailable.append('API check could not run: ' + report['api_chain_report'])
+            elif report['api_chain_rc'] == 1:
+                findings.append('API_CHAIN_VALIDATION_FAILED:\n' + report['api_chain_report'])
+            raise FinalValidationUnavailable('\n'.join(unavailable), '\n'.join(findings))
         if complete:
             return ''
         return 'SEMANTIC_VALIDATION_FAILED: ' + json.dumps({
@@ -823,22 +842,10 @@ def do_backport(
             'api_chain': report['api_chain_report'],
         }, ensure_ascii=False)
 
-    all_groups_complete, global_result = evaluate_global_artifact(
-        project, complete_patch, complete_path, ported_dir, hunks_by_idx,
-        selected_hunks, accepted_need_not_ported, any_strict_requires_patch,
-        cumulative,
-    )
-
-    if global_result['coverage']['method'] == 'semantic_review_failed':
-        logger.error('Backport INCOMPLETE: final review could not finish. Candidate retained; '
-                     'review/API errors are not evidence that code must be rewritten.')
-        return
-
     if not complete_patch.strip():
         logger.error('Backport INCOMPLETE: no nonempty candidate to validate or repair.')
         return
-    # Full-patch mode is distinct from semantic acceptance. The callback rejects
-    # missing obligations before any build, including candidates from final repair.
+    # Full-patch mode runs build/test before checking semantic acceptance.
     project.all_hunks_applied_succeeded = True
     project.final_artifact_check = final_artifact_check
 
@@ -855,6 +862,10 @@ def do_backport(
     project.context_mismatch_times = 0
     project.full_patch_base = validation_base
     validate_ret = project._validate(validation_base, complete_patch)
+    if project.final_validation_unavailable and not project.final_repair_required:
+        logger.error('Backport INCOMPLETE: build/test passed, but final validation is unavailable. '
+                     'Candidate retained; no concrete code defect was found to send for repair.')
+        return
     if project.poc_succeeded:
         project.persist_validated_patch(complete_patch, validation_base)
         write_patch_atomic(complete_path, complete_patch)
@@ -875,8 +886,9 @@ def do_backport(
         ]
     )
     # XXX maybe refactor initial_agent function to cover
+    project.query_progress = QueryProgress(project.query_stale_limit)
     viewcode, locate_symbol, validate, _, _ = project.get_tools()
-    tools = [viewcode, locate_symbol, validate]
+    tools = [viewcode, locate_symbol, validate, create_find_references_tool(project)]
     agent = create_tool_calling_agent(llm, tools, prompt)
     agent_executor = AgentExecutor(
         agent=agent, tools=tools, verbose=True,
@@ -917,7 +929,8 @@ def do_backport(
             project.checkpoint_dir, "latest-validated.patch"
         )
         if os.path.isfile(latest_checkpoint):
-            checkpoint_text = open(latest_checkpoint, encoding="utf-8").read()
+            with open(latest_checkpoint, encoding="utf-8") as checkpoint_file:
+                checkpoint_text = checkpoint_file.read()
             if checkpoint_text and checkpoint_text not in candidates:
                 candidates.append(checkpoint_text)
 

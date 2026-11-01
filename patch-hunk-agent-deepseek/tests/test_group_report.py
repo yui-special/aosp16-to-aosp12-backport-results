@@ -81,7 +81,7 @@ class GroupComparisonTests(unittest.TestCase):
         for i, item in enumerate(groups):
             item["hunks"] = [i]
         project = SimpleNamespace(
-            repo=MagicMock(), dir=str(self.directory), succeeded_patches=[], round_succeeded=False,
+            repo=MagicMock(), source_index=MagicMock(), dir=str(self.directory), succeeded_patches=[], round_succeeded=False,
             _get_patch=lambda _: "upstream fixture",
         )
 
@@ -101,10 +101,12 @@ class GroupComparisonTests(unittest.TestCase):
                                patch_dataset_dir=str(self.directory) + "/")
         hunks = [{"idx": i, "file": g["files"][0], "text": g["text"]}
                  for i, g in enumerate(groups)]
-        with patch.object(runtime, "logger", self.logger), \
+        with patch.object(runtime, "ApiCatalog", return_value=SimpleNamespace(
+                inventory=lambda *args: {"apis": []})), \
+                patch.object(runtime, "logger", self.logger), \
                 patch.object(runtime, "group_patch", return_value=("", groups)), \
                 patch.object(runtime, "split_patch_indexed", return_value=("", hunks)), \
-                patch.object(runtime, "evaluate_global_artifact", side_effect=StopIteration('report boundary')):
+                patch.object(runtime, "CoverageReviewer", side_effect=StopIteration('report boundary')):
             with self.assertRaises(StopIteration):
                 runtime.do_backport(executor, project, data, None,
                                     str(self.directory / "runtime.log"))
@@ -123,6 +125,12 @@ class GroupComparisonTests(unittest.TestCase):
         self.assertEqual(self.stream.getvalue().count("[GROUP COMPARISON]"), 3)
 
     def test_cumulative_report_uses_actual_commit_not_revision_history(self):
+        self.check_cumulative_report()
+
+    def test_failed_commit_is_never_recorded_as_an_applied_group(self):
+        self.check_cumulative_report(fail_commit=True)
+
+    def check_cumulative_report(self, fail_commit=False):
         from git import Repo
         from agent import invoke_llm as runtime
 
@@ -139,7 +147,7 @@ class GroupComparisonTests(unittest.TestCase):
         original = group(0)
         original["hunks"] = [0]
         original["text"] = "+void repaired() {}\n"
-        project = SimpleNamespace(repo=repo, dir=repo.working_tree_dir, succeeded_patches=[], round_succeeded=False,
+        project = SimpleNamespace(repo=repo, source_index=MagicMock(), dir=repo.working_tree_dir, succeeded_patches=[], round_succeeded=False,
                                   _get_patch=lambda _: "upstream fixture",
                                   _apply_hunk=lambda *args: "context mismatch")
 
@@ -153,21 +161,43 @@ class GroupComparisonTests(unittest.TestCase):
                                cumulative=True, cum_base=base,
                                patch_dataset_dir=str(self.directory) + "/")
         hunks = [{"idx": 0, "file": "Example.java", "text": original["text"]}]
-        with patch.object(runtime, "logger", self.logger), \
+        ledger = runtime.ChangeLedger()
+        commit = (lambda *args: False) if fail_commit else runtime.commit_group
+        with patch.object(runtime, "ChangeLedger", return_value=ledger), \
+                patch.object(runtime, "commit_group", side_effect=commit), \
+                patch.object(runtime, "ApiCatalog", return_value=SimpleNamespace(
+                inventory=lambda *args: {"apis": []})), \
+                patch.object(runtime, "logger", self.logger), \
                 patch.object(runtime, "group_patch", return_value=("", [original])), \
                 patch.object(runtime, "split_patch_indexed", return_value=("", hunks)), \
-                patch.object(runtime, "evaluate_global_artifact", side_effect=StopIteration('report boundary')), \
+                patch.object(runtime, "CoverageReviewer", side_effect=StopIteration('report boundary')), \
                 patch.dict("os.environ", {"PG_COMPILE_PER_GROUP": "0"}):
             with self.assertRaises(StopIteration):
                 runtime.do_backport(SimpleNamespace(invoke=invoke), project, data, None,
                                     str(self.directory / "runtime.log"))
         report_path = self.directory / "merged_hunks/ported/group-comparison.md"
+        if fail_commit:
+            status = json.loads((report_path.parent / 'merged-hunk-00.status.json').read_text())
+            self.assertFalse(status['round_succeeded'])
+            self.assertFalse(status['complete'])
+            self.assertEqual(status['executions'][-1]['reason'], 'group_commit_failed')
+            self.assertFalse((report_path.parent / 'merged-hunk-00.patch').exists())
+            self.assertEqual(ledger.entries, [])
+            self.assertEqual(project.succeeded_patches, [])
+            return
+        self.assertEqual(len(ledger.entries), 1)
         after = report_path.read_text().split("### 移植后", 1)[1]
         self.assertEqual(after.count("void repaired()"), 1)
         self.assertIn(repo.git.diff(base, "cumulative"), after)
         self.assertNotIn("discarded_revision", after)
         self.assertNotIn("candidate_history", after)
         self.assertNotEqual(repo.head.commit.hexsha, base)
+        saved = (report_path.parent / 'merged-hunk-00.patch').read_text()
+        self.assertEqual(saved.strip(), repo.git.diff(base, 'cumulative').strip())
+        self.assertEqual(len(project.succeeded_patches), 1)
+        self.assertNotIn('candidate_history', saved)
+        status = json.loads((report_path.parent / 'merged-hunk-00.status.json').read_text())
+        self.assertEqual(status['executions'][0]['reason'], 'candidate_recorded')
 
 
 if __name__ == "__main__":
