@@ -4,6 +4,7 @@ import glob
 import logging
 import os
 import shutil
+import sys
 import time
 from types import SimpleNamespace
 
@@ -14,7 +15,6 @@ from agent.invoke_llm import build_hunk_executor, do_backport, initial_agent
 from tools.logger import add_file_handler, logger
 from tools.project import Project
 from tools.utils import (
-    dump_merged_hunks,
     group_patch,
     load_hunk_groups,
     load_merged_hunk_files,
@@ -80,6 +80,7 @@ def load_yml(file_path: str):
     )
     data.coverage_model = config.get("coverage_model") or data.llm_model
     for name, default, minimum in (
+        ('query_stale_limit', 4, 1), ('ledger_chars', 6000, 0),
         ('llm_timeout_seconds', 300, 1), ('llm_max_retries', 1, 0),
         ('coverage_retries', 0, 0), ('coverage_review_iterations', 20, 1),
         ('coverage_review_retries', 1, 0), ('final_repair_iterations', 20, 1),
@@ -140,6 +141,8 @@ def load_yml(file_path: str):
     groups_path = config.get("hunk_groups", "") or ""
     if groups_path and not os.path.isabs(groups_path):
         groups_path = os.path.join(data.patch_dataset_dir, groups_path)
+    if groups_path and not os.path.isfile(groups_path):
+        raise FileNotFoundError("configured hunk groups file does not exist: %s" % groups_path)
     if not groups_path:
         candidates = sorted(
             glob.glob(os.path.join(data.patch_dataset_dir, "*hunk*groups*.json"))
@@ -164,6 +167,8 @@ def load_yml(file_path: str):
     merged_dir = config.get("merged_hunks_dir", "") or ""
     if merged_dir and not os.path.isabs(merged_dir):
         merged_dir = os.path.join(data.patch_dataset_dir, merged_dir)
+    if merged_dir and not os.path.isdir(merged_dir):
+        raise FileNotFoundError("configured merged hunk directory does not exist: %s" % merged_dir)
     if not merged_dir:
         cand = os.path.join(data.patch_dataset_dir, "merged_hunks", "original")
         if os.path.isdir(cand):
@@ -253,7 +258,6 @@ def main():
     # use LLM to backport
 
     project = Project(data)
-    project.repo.git.clean("-fdx")
 
     # 分组完整性：一份漏了 hunk 的规格不该静默退化成"逐个 hunk 移植"
     if getattr(data, "hunk_groups_spec", None):
@@ -306,11 +310,9 @@ def main():
                 "本次只处理: %s（--only-group %s）"
                 % ([i for i, _ in sel], data.hunk_group_index)
             )
-        if not src:
-            out_dir = os.path.join(data.patch_dataset_dir, "merged_hunks")
-            dump_merged_hunks(merged, out_dir)
-            print("已写出: %s/index.md 与 %s/original/*.patch" % (out_dir, out_dir))
         return
+
+    project.repo.git.clean("-fdx")
 
     # ---- 累积模式 --------------------------------------------------------
     # 每组跑完后把该组产物提交到临时分支，下一组从「已含前面各组改动」的状态继续。
@@ -352,8 +354,10 @@ def main():
             llm, project, debug_mode, group_mode=True, max_iterations=budget
         )
 
+    exit_code = 2
     try:
         do_backport(agent_executor, project, data, llm, logfile, make_agent=make_agent)
+        exit_code = 0 if project.poc_succeeded else 2
         end_time = time.time()
         time.sleep(10)
         
@@ -361,6 +365,7 @@ def main():
             f"This patch total cost time: {int(end_time - start_time)} Seconds."
         )
     except KeyboardInterrupt:
+        exit_code = 130
         logger.debug("Start to calculate cost!")
         end_time = time.time()
 
@@ -369,10 +374,11 @@ def main():
         )
 
     shutil.copy(logfile, data.patch_dataset_dir)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 
 #                    Version A           Version A(Fixed)
 #   ┌───┐            ┌───┐             ┌───┐
