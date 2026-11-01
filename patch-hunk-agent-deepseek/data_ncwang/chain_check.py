@@ -4,11 +4,12 @@
 
 原理（与 CVE 无关）：
   1. 从 patch 里找出「同一个方法名，在 - 行和 + 行参数个数不同」的签名变更；
-  2. 在打完补丁的工作树里 grep 这个名字的调用点，数参数个数；
+  2. 在基线加补丁生成的候选树中查找调用点，数参数个数；
   3. 如果还有调用点用旧个数 -> 报 MISSING_CALLSITE。
 
-用法: chain_check.py <repo_dir> <patch_file> [pathspec...]
+用法: chain_check.py <repo_dir> <patch_file> [pathspec...] [--base <target_commit>]
 """
+import argparse
 import os
 import re
 import subprocess
@@ -123,7 +124,7 @@ def patch_candidate_tree(repo, base_ref, patch_text):
         )
         applied = subprocess.run(
             command + [
-                'apply', '--cached', '--recount', '--ignore-whitespace', '-'
+                'apply', '--cached', '--recount', '-'
             ],
             input=patch_text,
             env=env,
@@ -143,12 +144,16 @@ def patch_candidate_tree(repo, base_ref, patch_text):
 
 
 def call_sites(repo, name, pathspecs, ref=''):
+    if not ref:
+        raise RuntimeError('CHAIN_CHECK_TREE_REQUIRED: specify a candidate tree or target base')
     cmd = ["git", "-C", repo, "grep", "-n", "-F", name + "("]
     if ref:
         cmd.append(ref)
     cmd.append('--')
     cmd += pathspecs or DEFAULT_GLOBS
     p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode not in (0, 1):
+        raise RuntimeError('Cannot inspect candidate source: ' + p.stderr.strip())
     for line in p.stdout.split("\n"):
         if ref and line.startswith(ref + ':'):
             line = line[len(ref) + 1:]
@@ -171,18 +176,26 @@ def call_sites(repo, name, pathspecs, ref=''):
 
 
 def main():
-    repo, patch_file = sys.argv[1], sys.argv[2]
-    pathspecs = sys.argv[3:]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('repo')
+    parser.add_argument('patch_file')
+    parser.add_argument('pathspecs', nargs='*')
+    parser.add_argument('--base', help='Apply the patch to this fixed target base using a private index')
+    args = parser.parse_args()
+    repo, patch_file, pathspecs = args.repo, args.patch_file, args.pathspecs
     if not pathspecs:
         pathspecs = [
             item.strip() for item in os.environ.get(
                 "CHAIN_CHECK_GLOBS", ",".join(DEFAULT_GLOBS)
             ).split(",") if item.strip()
         ]
-    patch_text = open(
-        patch_file, encoding="utf-8", errors="replace"
-    ).read()
+    with open(patch_file, encoding='utf-8', errors='surrogateescape') as handle:
+        patch_text = handle.read()
     ref = os.environ.get('CHAIN_CHECK_REF', '').strip()
+    if args.base:
+        # An explicit base must override any inherited candidate from an older run.
+        ref = patch_candidate_tree(repo, args.base,
+                                   patch_text if patch_text.endswith('\n') else patch_text + '\n')
     if not ref:
         base_ref = os.environ.get('CHAIN_CHECK_BASE_REF', '').strip()
         if not base_ref:
@@ -193,14 +206,19 @@ def main():
             )
             sys.exit(2)
         try:
-            ref = patch_candidate_tree(repo, base_ref, patch_text)
-        except (OSError, subprocess.SubprocessError) as exc:
+            ref = patch_candidate_tree(repo, base_ref,
+                                       patch_text if patch_text.endswith('\n') else patch_text + '\n')
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             print(
                 "CHAIN_CHECK_CANDIDATE_APPLY_FAILED: %s" % exc,
                 file=sys.stderr,
             )
             sys.exit(2)
 
+    # Resolve symbolic refs once, including when there are no changed signatures.
+    ref = subprocess.check_output(['git', '-C', repo, 'rev-parse', '--verify', ref + '^{tree}'],
+                                  text=True, stderr=subprocess.PIPE).strip()
+    print('candidate_tree=' + ref)
     changed = signatures_from_patch(patch_text)
     bad = []
     for name, info in sorted(changed.items()):
@@ -220,4 +238,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        print('CHAIN_CHECK_ERROR: ' + str(exc), file=sys.stderr)
+        sys.exit(2)
