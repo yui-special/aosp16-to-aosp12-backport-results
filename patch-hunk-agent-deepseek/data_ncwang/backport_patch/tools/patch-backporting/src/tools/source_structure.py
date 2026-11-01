@@ -212,6 +212,77 @@ class Source:
     def symbols(self):
         return [(d["name"], d["name_line"]) for d in self.declarations if d["kind"] != "lambda"]
 
+    def definitions(self, symbol):
+        """Exact declarations, never a name appearing only in a call/comment."""
+        name = normalize_symbol(symbol)
+        package = ""
+        if self.tree:
+            p = typed_child(self.tree.root_node, "package_declaration")
+            if p:
+                package = re.sub(r"^package\s+|;\s*$", "", self.text(p)).strip()
+        return [{k: v for k, v in d.items() if not k.startswith("_")}
+                for d in self.declarations if d["kind"] != "lambda" and
+                (d["name"] == name if "." not in name else
+                 name in {d["qualified_name"], package + "." + d["qualified_name"]})]
+
+    def references(self, symbol=None):
+        """Enumerate syntactic call candidates; no receiver/type equivalence claim."""
+        if not self.tree:
+            return []
+        wanted = normalize_symbol(symbol).rsplit(".", 1)[-1] if symbol else None
+        rows = []
+        for node in walk(self.tree.root_node):
+            if node.type not in CALLS | {"method_reference"}:
+                continue
+            name = child(node, "name", "function", "type")
+            if name is None and node.type == "call_expression":
+                name = node.named_children[0] if node.named_children else None
+            if name is None and node.type == "method_reference":
+                name = next((n for n in reversed(node.named_children) if n.type in IDENTIFIERS), None)
+            callee = self.text(name)
+            if wanted is not None and re.split(r"[.:>]", callee)[-1] != wanted:
+                continue
+            args = child(node, "arguments") or typed_child(node, "value_arguments")
+            scopes = [d for d in self.declarations if d["kind"] in {"function", "lambda"}
+                      and d["_node"].start_byte <= node.start_byte < d["_node"].end_byte]
+            owner = min(scopes, key=lambda d: d["_node"].end_byte-d["_node"].start_byte) if scopes else None
+            arguments = ([self.text(a) for a in args.named_children if "comment" not in a.type]
+                         if args is not None else None)
+            receiver = child(node, "object")
+            if receiver is None and node.type == "method_reference" and node.named_children:
+                receiver = node.named_children[0]
+            if receiver is None and name is not None:
+                receiver = child(name, "object", "argument", "value")
+            rows.append({"path": self.path, "line": node.start_point.row + 1,
+                         "end_line": node.end_point.row + 1, "callee": callee,
+                         "receiver": self.text(receiver),
+                         "arguments": arguments,
+                         "argument_count": len(arguments) if arguments is not None else None,
+                         "expression": self.text(node), "scope": owner["qualified_name"] if owner else "",
+                         "kind": node.type, "parse_error": node.has_error,
+                         "resolution": "syntactic_candidate"})
+        return rows
+
+    @lru_cache(maxsize=8)
+    def java_imports(self):
+        """Explicit type imports only; shadowing/ambiguity prevents automatic edges."""
+        imports, shadowed = {}, set()
+        if self.language != "java" or self.status != "ok":
+            return imports, shadowed
+        for node in walk(self.tree.root_node):
+            if node.type == "import_declaration":
+                match = re.fullmatch(r"import\s+([\w.]+)\s*;", self.text(node).strip())
+                if match:
+                    qualified = match[1]
+                    imports.setdefault(qualified.rsplit(".", 1)[-1], []).append({
+                        "qualified_name": qualified, "line": node.start_point.row + 1,
+                        "text": self.text(node)})
+            elif node.type in TYPES | {"variable_declarator", "formal_parameter", "type_parameter"}:
+                name = declarator_name(node) or typed_child(node, "type_identifier")
+                if name:
+                    shadowed.add(self.text(name))
+        return imports, shadowed
+
     def evidence(self, changed_lines, start, count):
         """Scopes contain changed lines; context-only neighbours do not own a hunk."""
         lines = set(changed_lines)
@@ -230,6 +301,7 @@ class Source:
                   "range": [start, count], "changed_lines": sorted(lines),
                   "scope_basis": "changed_lines" if lines else "context_only",
                   "scopes": [], "enclosing_functions": ancestors, "calls": [], "identifiers": [],
+                  "imports": [], "import_uses": [], "statements": [],
                   "writes": [], "declarations": [{k: d[k] for k in ("name", "qualified_name", "signature", "kind")}
                      for d in self.declarations if d["kind"] == "symbol" and d["name_line"] in lines]}
         if self.reason:
@@ -240,6 +312,9 @@ class Source:
             entry["signature_changed"] = any(d["start"] <= n <= d["signature_end"] for n in lines)
             result["scopes"].append(entry)
         if self.tree:
+            imports, shadowed = self.java_imports()
+            result["imports"] = [entry for entries in imports.values() for entry in entries
+                                 if entry["line"] in lines]
             identifiers = set()
             stack = [self.tree.root_node]
             while stack:
@@ -247,7 +322,25 @@ class Source:
                 if not any(n.start_point.row + 1 <= line <= n.end_point.row + 1 for line in lines):
                     continue
                 if n.type in IDENTIFIERS:
-                    identifiers.add(self.text(n))
+                    name = self.text(n)
+                    identifiers.add(name)
+                    # A qualified use, string/comment or shadowed name is not proof
+                    # that this import supplies the identifier. Static/wildcard
+                    # imports and other languages remain semantic-review work.
+                    entries = imports.get(name, [])
+                    if (len(entries) == 1 and name not in shadowed and n.parent
+                            and n.parent.type not in {"scoped_identifier", "scoped_type_identifier",
+                                                      "field_access", "import_declaration"}
+                            and (n.type == "type_identifier" or
+                                 (n.parent.type == "method_invocation" and child(n.parent, "object") == n))):
+                        result["import_uses"].append({"qualified_name": entries[0]["qualified_name"],
+                                                     "line": n.start_point.row + 1, "identifier": name})
+                if n.type in {"expression_statement", "return_statement", "assert_statement",
+                              "throw_statement", "local_variable_declaration"}:
+                    # Keep the complete changed statement: an assertion's receiver
+                    # often lies on an unchanged line above its new expected value.
+                    result["statements"].append({"line": n.start_point.row + 1,
+                                                "end": n.end_point.row + 1, "text": self.text(n)})
                 if n.type in CALLS:
                     name = child(n, "name", "function", "type")
                     args = child(n, "arguments") or typed_child(n, "value_arguments")
@@ -342,8 +435,38 @@ def hunk_coordinates(hunk):
             (new_path, new_start, new_count, new_lines))
 
 
+def evidence_fingerprint(parent, commit, hunk):
+    return hashlib.sha256(json.dumps([parent, commit, hunk["file"], hunk["text"], settings()],
+                                    sort_keys=True).encode()).hexdigest()
+
+
+def syntax_summary(evidence):
+    """Facts for the summarizer, including every scope crossed by a hunk."""
+    return {"signature_changes": evidence.get("signature_changes", []),
+            **{side: {k: evidence[side].get(k) for k in
+                      ("status", "reason", "path", "scopes", "calls", "declarations",
+                       "writes", "context", "context_truncated")}
+               for side in ("before", "after")}}
+
+
+def compact_evidence(evidence):
+    """Prompt view; the full source evidence stays in the grouping artifact."""
+    result = {k: evidence[k] for k in ('before_ref', 'after_ref', 'signature_changes',
+                                     'cast_only_assignment') if k in evidence}
+    for side in ('before', 'after'):
+        facts = evidence.get(side, {})
+        result[side] = {k: facts[k] for k in ('path', 'status', 'reason', 'range', 'changed_lines',
+                       'calls', 'writes', 'declarations', 'imports', 'import_uses',
+                       'statements', 'context', 'context_truncated') if k in facts and facts[k]}
+        result[side]['scopes'] = [{k: d[k] for k in ('qualified_name', 'kind', 'start', 'end',
+               'signature', 'parameter_names', 'signature_changed', 'parse_error') if k in d}
+               for d in facts.get('scopes', [])]
+    return result
+
+
 def hunk_evidence(repo, parent, commit, hunk):
-    result = {"before_ref": parent, "after_ref": commit}
+    result = {"before_ref": parent, "after_ref": commit,
+              "input_fingerprint": evidence_fingerprint(parent, commit, hunk)}
     snapshots = []
     for key, ref, (path, start, count, lines) in zip(
             ("before", "after"), (parent, commit), hunk_coordinates(hunk)):
@@ -486,12 +609,17 @@ def structure_relations(records):
     return relations
 
 
+def normalize_symbol(symbol):
+    return re.sub(r"\([^)]*\)\s*$", "", symbol).replace("::", ".").replace("#", ".").strip()
+
+
 class SymbolIndex:
     """Lazy exact lookup; immutable SHA keys never require checkout/reset."""
     def __init__(self, repo):
         self.repo = os.path.realpath(repo)
         self.maps, self.complete, self.diagnostics = {}, set(), {}
-        self.parsed, self.looked_up = set(), set()
+        self.parsed = set()
+        self.inspections = {}
 
     def _add(self, sha, path):
         if (sha, path) in self.parsed:
@@ -507,21 +635,37 @@ class SymbolIndex:
         self.parsed.add((sha, path))
 
     def locate(self, ref, symbol):
+        return sorted({(d["path"], d["name_line"])
+                       for d in self.inspect(ref, symbol)["definitions"]}) or None
+
+    def inspect(self, ref, symbol):
+        """Return all searched declarations/call candidates and explicit parse gaps."""
         sha = resolve_ref(self.repo, ref)
-        if sha in self.complete or (sha, symbol) in self.looked_up:
-            return sorted(self.maps.get(sha, {}).get(symbol, [])) or None
-        # A cached symbol may be only partially populated by another name's file.
-        result = subprocess.run(["git", "-C", self.repo, "grep", "-Ilz", "-F", "-w",
-                                 "-e", symbol, sha, "--"], capture_output=True)
+        symbol = normalize_symbol(symbol)
+        key = (sha, symbol)
+        if key in self.inspections:
+            return self.inspections[key]
+        name = symbol.replace("::", ".").rsplit(".", 1)[-1]
+        result = subprocess.run(["git", "-C", self.repo, "grep", "-Ilz", "-F",
+                                 "-e", name, sha, "--"], capture_output=True)
         if result.returncode not in (0, 1):
-            raise RuntimeError("Git symbol candidate search failed")
+            raise RuntimeError("Git reference candidate search failed")
+        definitions, references, diagnostics = [], [], []
         for item in result.stdout.split(b"\0"):
-            if item:
-                path = os.fsdecode(item).split(":", 1)[1]
-                if language_for(path):
-                    self._add(sha, path)
-        self.looked_up.add((sha, symbol))
-        return sorted(self.maps.get(sha, {}).get(symbol, [])) or None
+            if not item:
+                continue
+            path = os.fsdecode(item).split(":", 1)[1]
+            if not language_for(path):
+                continue
+            source = snapshot(self.repo, sha, path)
+            if source.status != "ok":
+                diagnostics.append({"path": path, "status": source.status, "reason": source.reason})
+            definitions.extend(dict(d, path=path) for d in source.definitions(symbol))
+            references.extend(source.references(name))
+        self.inspections[key] = {"ref": sha, "symbol": symbol, "definitions": definitions,
+                "references": references, "diagnostics": diagnostics,
+                "reference_resolution": "name candidates; receiver/overload binding is not proven"}
+        return self.inspections[key]
 
     def prepare(self, ref):
         sha = resolve_ref(self.repo, ref)

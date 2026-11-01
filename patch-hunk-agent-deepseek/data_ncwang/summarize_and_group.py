@@ -3,6 +3,7 @@
 # 实验：逐 hunk LLM summary -> 机械建边 -> 连通分量
 # 用法: summarize_and_group.py <patch> <out_json> [model]
 import json
+import argparse
 import os
 import re
 import sys
@@ -15,6 +16,7 @@ import urllib.request
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "backport_patch/tools/patch-backporting/src"))
 from tools.utils import split_patch_indexed  # noqa: E402
+from tools.source_structure import hunk_evidence, resolve_ref, syntax_summary  # noqa: E402
 
 BASE = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
 SYS = (
@@ -32,8 +34,8 @@ kind 只能取：
   logic     —— 修改函数内部逻辑（条件、赋值、校验）
   noise     —— 版本号、注释、时间戳等与行为无关的改动
 
-symbol：被 declare / implement / call 的方法名（没有就空串）
-param_change：该 hunk 是否改变了这个方法的参数（"add" / "remove" / "none"）
+函数名、完整签名、参数变化和直接调用由程序从固定版本源码提取，见下方语法事实。
+不要重新猜测这些字段。解析缺口代表未知；语法事实不证明目标版本接口等价。
 
 semantic_contract 必须描述修复语义，而不是只复述代码。字段：
   goal               —— 这个改动要保证/阻止什么行为
@@ -59,7 +61,7 @@ semantic_contract 必须描述修复语义，而不是只复述代码。字段�
 非代码或 noise hunk 的 semantic_contract 可以字段为空，但仍要输出全部字段。
 
 只输出严格 JSON：
-{{"kind": "...", "symbol": "...", "param_change": "...", "summary": "一句中文",
+{{"kind": "...", "summary": "一句中文",
   "semantic_contract": {{"goal": "...", "behavior": "...", "enclosing_role": "...", "inputs": [], "preconditions": [],
   "state_read": [], "state_written": [], "side_effects": [], "failure_behavior": "...",
   "call_chain": [], "callers": [], "callees": [], "symbol_relations": [],
@@ -189,10 +191,45 @@ def call_json(key, model, prompt, request_options=None, read_timeout=60.0):
             raise ValueError("JSON parse failed after repair: %s" % second_error)
 
 
+def attach_syntax(obj, evidence):
+    """Legacy labels come from syntax; multiple scopes are never collapsed by a model."""
+    obj["symbol"], obj["param_change"] = "", "unknown"
+    if evidence is None:
+        obj["syntax_status"] = "unavailable_without_source_refs"
+        return
+    obj["source_structure"] = evidence
+    complete = all(evidence[s]["status"] in {"ok", "missing"} for s in ("before", "after"))
+    obj["syntax_status"] = "ok" if complete else "incomplete"
+    names = sorted({d["name"] for s in ("before", "after") for d in evidence[s]["scopes"]
+                    if d["kind"] == "function" and not d["parse_error"]})
+    obj["symbols"] = names
+    obj["symbol"] = names[0] if len(names) == 1 else ""
+    if complete:
+        changes = evidence["signature_changes"]
+        labels = set()
+        for change in changes:
+            old, new = change["old_types"], change["new_types"]
+            if old is None or new is None:
+                labels.add("new_declaration" if old is None else "removed_declaration")
+            else:
+                labels.add("add" if len(new) > len(old) else "remove" if len(new) < len(old) else "replace")
+        obj["param_change"] = next(iter(labels)) if len(labels) == 1 else "mixed" if labels else "none"
+
+
 def main():
-    patch, out = sys.argv[1], sys.argv[2]
-    model = (sys.argv[3] if len(sys.argv) > 3
-             else os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("patch")
+    parser.add_argument("out")
+    parser.add_argument("model", nargs="?", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"))
+    parser.add_argument("--repo")
+    parser.add_argument("--commit")
+    args = parser.parse_args()
+    if bool(args.repo) != bool(args.commit):
+        parser.error("--repo and --commit must be supplied together")
+    patch, out, model = args.patch, args.out, args.model
+    if args.repo:
+        commit = resolve_ref(args.repo, args.commit)
+        parent = resolve_ref(args.repo, commit + "^")
     key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("LLM_KEY", "")
     if not key:
         sys.exit("缺 DEEPSEEK_API_KEY（兼容 LLM_KEY）")
@@ -204,7 +241,10 @@ def main():
     rows = []
     hunk_retries = int(os.environ.get("SUMMARY_HUNK_RETRIES", "2"))
     for h in hunks:
+        evidence = hunk_evidence(args.repo, parent, commit, h) if args.repo else None
         prompt = TPL.format(file=h["file"], hunk=h["text"])
+        prompt += "\n程序提取的语法事实：\n" + json.dumps(
+            syntax_summary(evidence) if evidence else {"status": "source_refs_not_supplied"}, ensure_ascii=False)
         obj = None
         last_error = None
         for attempt in range(hunk_retries + 1):
@@ -219,6 +259,7 @@ def main():
             obj = {"kind": "unknown", "symbol": "", "param_change": "",
                    "summary": "CALL_FAILED: %s" % last_error, "call_failed": True,
                    "summary_attempts": hunk_retries + 1}
+        attach_syntax(obj, evidence)
         obj["semantic_contract"] = normalize_contract(obj)
         obj["hunk"] = h["idx"]
         obj["file"] = h["file"]
