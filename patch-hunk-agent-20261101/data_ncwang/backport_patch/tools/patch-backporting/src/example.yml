@@ -1,0 +1,15 @@
+project: libtiff
+project_url: https://github.com/libsdl-org/libtiff
+new_patch: 881a070194783561fd209b7c789a4e75566f7f37
+new_patch_parent: 6bb0f1171adfcccde2cd7931e74317cccb7db845
+target_release: 13f294c3d7837d630b3e9b08089752bc07b730e6
+sanitizer: LeakSanitizer
+error_message: "ERROR: LeakSanitizer"
+tag: CVE-2023-3576
+# API 凭据推荐通过 DEEPSEEK_API_KEY 环境变量提供，不要写入 YAML。
+llm_base_url: https://api.deepseek.com/v1
+llm_model: deepseek-flash
+coverage_model: deepseek-flash
+project_dir: dataset/libsdl-org/libtiff
+patch_dataset_dir: ~/backports/patch_dataset/libtiff/CVE-2023-3576/
+

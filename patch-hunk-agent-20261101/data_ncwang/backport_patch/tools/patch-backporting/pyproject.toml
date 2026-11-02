@@ -1,0 +1,34 @@
+[project]
+name = "patch-backporting"
+version = "0.0.1"
+description = "Automated patch backporting tool using latest LLMs."
+authors = [
+    {name = "hai119", email = "lzy445850071@gmail.com"},
+    {name = "Zhaoyang Li", email = "lzy445850071@gmail.com"},
+    {name = "Song Jingyi", email = "jingyisong@hust.edu.cn"},
+    {name = "EarthCompass", email = "mx_xiang@hust.edu.cn"},
+    {name = "jingfelix", email = "jingfelix@outlook.com"},
+]
+dependencies = [
+    "langchain>=0.2.2",
+    "python-dotenv>=1.0.1",
+    "GitPython>=3.1.43",
+    "Levenshtein>=0.25.1",
+    "langchain-openai>=0.1.8",
+    "rich>=13.7.1",
+    "PyYAML>=6.0.1",
+    "tree-sitter==0.25.2",
+    "tree-sitter-java==0.23.5",
+    "tree-sitter-c==0.24.1",
+    "tree-sitter-cpp==0.23.4",
+    "tree-sitter-kotlin==1.1.0",
+    "tree-sitter-python==0.25.0",
+    "tree-sitter-rust==0.24.0",
+]
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "None"}
+
+
+[tool.pdm]
+distribution = false
