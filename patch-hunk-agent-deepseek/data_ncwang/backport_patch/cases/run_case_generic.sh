@@ -64,6 +64,47 @@ export MAP_MODEL=${MAP_MODEL:-$(config_value map_model)}
 export MAP_MODEL=${MAP_MODEL:-$LLM_MODEL}
 if [ -z "${LLM_KEY:-}" ]; then echo "NO_KEY" >> "$OUT/status.txt"; exit 1; fi
 
+REPAIR_FROM=$(config_value repair_from) || exit 1
+REPAIR_ARGS=()
+if [ -n "$REPAIR_FROM" ]; then
+  REUSE_CASE=$(config_value reuse_case) || exit 1
+  "$PY" - "$INPUT_CONFIG" "$REUSE_CASE" "$CASE" "$DS" "$REPO" "$TARGET" "$REPAIR_FROM" <<'PY'
+import hashlib, json, shutil, subprocess, sys
+from pathlib import Path
+import yaml
+config_path, source, destination, dataset, repo, target, candidate = map(Path, sys.argv[1:])
+config = yaml.safe_load(config_path.read_text())
+previous = yaml.safe_load((source / 'config.yml').read_text())
+assert candidate.is_file() and candidate.stat().st_size, 'Missing repair_from candidate'
+assert source.resolve() != destination.resolve(), 'Reuse must not overwrite its source case'
+assert config['new_patch'] == previous['new_patch'], 'Upstream patch changed'
+old_base = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', '--verify',
+                                    previous['target_release'] + '^{commit}'], text=True).strip()
+assert old_base == str(target), 'Target base changed'
+original = source / 'inputs/merged_hunks/original'
+groups = source / 'inputs/hunk_groups.json'
+assert original.is_dir() and groups.is_file(), 'Missing exported frontend inputs'
+shutil.copytree(original, destination / 'inputs/merged_hunks/original')
+shutil.copy2(groups, destination / 'inputs/hunk_groups.json')
+metadata = dict(reuse_case=str(source.resolve()), repair_from=str(candidate.resolve()),
+                candidate_sha256=hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                target_release=str(target), new_patch=config['new_patch'])
+(destination / 'inputs/reuse.json').write_text(json.dumps(metadata, indent=2) + '\n')
+PY
+  [ "$?" = 0 ] || fail_stage reuse_inputs 1
+  REPAIR_ARGS=(--repair-from "$REPAIR_FROM")
+  echo "FRONTEND_REUSED case=$REUSE_CASE" | tee -a "$OUT/status.txt"
+else
+FRONTEND_OPTIONS=${FRONTEND_OPTIONS:-$("$PY" - "$INPUT_CONFIG" <<'PY'
+import json, sys, yaml
+config = yaml.safe_load(open(sys.argv[1]))
+options = config.get('frontend', {})
+if not isinstance(options, dict):
+    raise SystemExit('frontend must be a configuration object')
+print(json.dumps(options))
+PY
+)} || fail_stage frontend_config 1
+export FRONTEND_OPTIONS
 echo "[0/6] detect languages" | tee -a "$OUT/status.txt"
 "$PY" "$SCRIPTS/v6_group.py" --detect-only "$DS/real.patch" > "$CASE/groups/languages.txt" 2>&1
 rc=$?
@@ -123,6 +164,7 @@ rm -rf "$CASE/inputs/merged_hunks"
 rc=$?
 echo "export rc=$rc" >> "$OUT/status.txt"
 [ "$rc" = 0 ] || fail_stage export "$rc"
+fi
 
 if [ "${STOP_AFTER_EXPORT:-0}" = "1" ]; then
   echo "READY_AFTER_EXPORT $(date -Is)" >> "$OUT/status.txt"
@@ -148,7 +190,7 @@ PY
 echo "[6/6] generate" | tee -a "$OUT/status.txt"
 git -C "$REPO" reset --hard >/dev/null 2>&1
 cd "$SRC" || exit 1
-timeout --foreground "${GENERATION_TIMEOUT:-10800}" "$PY" backporting.py -c "$CFG" --cumulative --allow-incomplete-groups --debug \
+timeout --foreground "${GENERATION_TIMEOUT:-10800}" "$PY" backporting.py -c "$CFG" "${REPAIR_ARGS[@]}" --cumulative --allow-incomplete-groups --debug \
   > "$OUT/run.log" 2>&1
 rc=$?
 echo "EXIT $rc $(date -Is)" >> "$OUT/status.txt"

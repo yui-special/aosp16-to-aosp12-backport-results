@@ -10,6 +10,26 @@ tag: CVE-2023-3576
 llm_base_url: https://api.deepseek.com/v1
 llm_model: deepseek-flash
 coverage_model: deepseek-flash
+coverage_temperature: 0.0
+context_query_limit: 10
+context_query_chars: 24000
+context_inline_chars: 6000  # Complete small API inventories; 0 keeps tool-only delivery.
+frontend:
+  workers: 3             # Independent summary/triage/mapping tasks; porting stays serial.
+  resume: true           # Set false for fresh stability measurements.
+  summary:
+    request_options: {temperature: 0}
+    read_timeout: 60
+  triage:
+    request_options: {temperature: 0}
+    read_timeout: 60
+  mapping:
+    request_options: {temperature: 0}
+    read_timeout: 75
+final_repair_retries: 2
+final_repair_category_switches: 2
+# Experiment switch: no backend agent iteration/read/retry/category-switch budgets.
+unlimited_backend: false
 project_dir: dataset/libsdl-org/libtiff
 patch_dataset_dir: ~/backports/patch_dataset/libtiff/CVE-2023-3576/
 

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import git
 import yaml
 
-from agent.invoke_llm import build_hunk_executor, do_backport, initial_agent
+from agent.invoke_llm import build_hunk_executor, build_llm, do_backport, initial_agent
 from tools.logger import add_file_handler, logger
 from tools.project import Project
 from tools.utils import (
@@ -79,11 +79,20 @@ def load_yml(file_path: str):
         or "deepseek-flash"
     )
     data.coverage_model = config.get("coverage_model") or data.llm_model
+    data.coverage_temperature = config.get('coverage_temperature', 0.0)
+    if type(data.coverage_temperature) not in (int, float) or not 0 <= data.coverage_temperature <= 2:
+        raise ValueError('coverage_temperature must be a number between 0 and 2')
+    data.unlimited_backend = config.get('unlimited_backend', False)
+    if type(data.unlimited_backend) is not bool:
+        raise ValueError('unlimited_backend must be a boolean')
     for name, default, minimum in (
         ('query_stale_limit', 4, 1), ('ledger_chars', 6000, 0),
+        ('context_query_limit', 10, 1), ('context_query_chars', 24000, 2000),
+        ('context_inline_chars', 6000, 0),
         ('llm_timeout_seconds', 300, 1), ('llm_max_retries', 1, 0),
         ('coverage_retries', 0, 0), ('coverage_review_iterations', 20, 1),
         ('coverage_review_retries', 1, 0), ('final_repair_iterations', 20, 1),
+        ('final_repair_retries', 2, 0), ('final_repair_category_switches', 2, 0),
     ):
         value = config.get(name, default)
         if type(value) is not int or value < minimum:
@@ -209,6 +218,8 @@ def main():
         "-c", "--config", type=str, required=True, help="CVE config yml"
     )
     parser.add_argument("-d", "--debug", action="store_true", help="enable debug mode")
+    parser.add_argument('--repair-from', metavar='PATCH',
+                        help='Reuse a complete candidate against target_release; skip group generation')
     parser.add_argument(
         "--list-groups",
         action="store_true",
@@ -246,6 +257,15 @@ def main():
 
     # load and check config, create file log
     data = load_yml(config_file)
+    data.repair_candidate = None
+    if args.repair_from:
+        if args.only_group is not None:
+            parser.error('--repair-from requires the full selected hunk set, not --only-group')
+        with open(args.repair_from, encoding='utf-8', errors='surrogateescape') as handle:
+            data.repair_candidate = handle.read()
+        if not data.repair_candidate.strip():
+            parser.error('--repair-from requires a nonempty complete patch')
+        data.cumulative = True
     data.hunk_group_index = args.only_group
     if args.coverage_retries is not None:
         data.coverage_retries = args.coverage_retries
@@ -344,7 +364,10 @@ def main():
         )
 
     start_time = time.time()
-    agent_executor, llm = initial_agent(project, data, debug_mode)
+    if data.repair_candidate is not None:
+        agent_executor, llm = None, build_llm(data)
+    else:
+        agent_executor, llm = initial_agent(project, data, debug_mode)
 
     # 每个 merged hunk 单独开一个 session（新的 AgentExecutor），用分组版 prompt
     def make_agent(group):

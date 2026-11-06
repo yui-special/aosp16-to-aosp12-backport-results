@@ -14,6 +14,22 @@ sys.path.insert(0, str(SRC))
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_invalid_candidate_replay_is_rejected_before_touching_worktree(self):
+        runtime = importlib.import_module('backporting')
+        with tempfile.TemporaryDirectory() as directory:
+            seed = Path(directory)/'candidate.patch'
+            seed.write_text('')
+            for extra in ([], ['--only-group', '0']):
+                with self.subTest(extra=extra), \
+                        patch.object(sys, 'argv', ['backporting.py', '-c', 'fixture.yml',
+                                                  '--repair-from', str(seed), *extra]), \
+                        patch.object(runtime, 'load_yml', return_value=SimpleNamespace()), \
+                        patch.object(runtime, 'Project') as project, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        runtime.main()
+                    project.assert_not_called()
+
     def test_list_groups_preserves_worktree_and_does_not_export_inputs(self):
         from git import Actor, Repo
         runtime = importlib.import_module('backporting')
@@ -105,21 +121,32 @@ class RuntimeConfigTests(unittest.TestCase):
                 'llm_timeout_seconds': 123, 'llm_max_retries': 2,
                 'coverage_review_iterations': 7, 'coverage_review_retries': 0,
                 'final_repair_iterations': 9,
+                'final_repair_retries': 1, 'final_repair_category_switches': 0,
                 'query_stale_limit': 3, 'ledger_chars': 12000,
+                'context_query_limit': 6, 'context_query_chars': 18000,
+                'context_inline_chars': 0,
+                'unlimited_backend': True,
             }))
             with patch.object(runtime, 'is_commit_valid', return_value=True), \
                     patch.object(runtime, 'rev_parse_commit', side_effect=lambda ref, _: ref):
                 data = runtime.load_yml(str(config))
             self.assertEqual(data.llm_model, 'deepseek-flash')
+            self.assertIs(data.unlimited_backend, True)
             self.assertEqual(data.llm_base_url, 'https://api.deepseek.com/v1')
             self.assertEqual(data.coverage_model, 'deepseek-flash')
+            self.assertEqual(data.coverage_temperature, 0.0)
             self.assertEqual(data.llm_timeout_seconds, 123)
             self.assertEqual(data.llm_max_retries, 2)
             self.assertEqual(data.coverage_review_iterations, 7)
             self.assertEqual(data.coverage_review_retries, 0)
             self.assertEqual(data.final_repair_iterations, 9)
+            self.assertEqual(data.final_repair_retries, 1)
+            self.assertEqual(data.final_repair_category_switches, 0)
             self.assertEqual(data.query_stale_limit, 3)
             self.assertEqual(data.ledger_chars, 12000)
+            self.assertEqual(data.context_query_limit, 6)
+            self.assertEqual(data.context_query_chars, 18000)
+            self.assertEqual(data.context_inline_chars, 0)
 
     def test_context_limits_reject_invalid_configuration(self):
         import yaml
@@ -127,7 +154,13 @@ class RuntimeConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / 'config.yml'
             for field, value in [('query_stale_limit', 0), ('query_stale_limit', True),
-                                 ('ledger_chars', -1), ('ledger_chars', '6000')]:
+                                 ('coverage_temperature', True), ('coverage_temperature', float('nan')),
+                                 ('coverage_temperature', -0.1), ('coverage_temperature', 2.1),
+                                 ('ledger_chars', -1), ('ledger_chars', '6000'),
+                                 ('context_query_limit', 0), ('context_query_chars', 1999),
+                                 ('context_inline_chars', -1), ('context_inline_chars', True),
+                                 ('final_repair_retries', -1), ('final_repair_retries', True),
+                                 ('final_repair_category_switches', -1), ('unlimited_backend', 'true')]:
                 with self.subTest(field=field, value=value):
                     config.write_text(yaml.safe_dump({field: value}))
                     with self.assertRaisesRegex(ValueError, field):

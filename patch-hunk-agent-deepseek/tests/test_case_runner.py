@@ -20,7 +20,10 @@ class CaseRunnerTests(unittest.TestCase):
     def test_configured_models_survive_and_postcheck_failure_is_propagated(self):
         self.run_pipeline(configured=True, generation_rc=0, chain_rc=1)
 
-    def run_pipeline(self, configured=False, generation_rc=23, chain_rc=0):
+    def test_repair_reuses_exported_inputs_and_skips_frontend(self):
+        self.run_pipeline(configured=True, generation_rc=0, reuse=True)
+
+    def run_pipeline(self, configured=False, generation_rc=23, chain_rc=0, reuse=False):
         with tempfile.TemporaryDirectory(prefix='configured pipeline ') as directory:
             base = Path(directory)
             root, scripts, dataset, case, out, repo, bin_dir = [base / name for name in
@@ -40,13 +43,27 @@ class CaseRunnerTests(unittest.TestCase):
                 settings.update(llm_model='generation-fixture', coverage_model='review-fixture',
                                 summary_model='summary-fixture', triage_model='triage-fixture',
                                 map_model='mapping-fixture', llm_base_url='http://127.0.0.1:9/custom')
+                settings['frontend'] = {'workers': 2, 'resume': False, 'summary': {'request_options': {'temperature': 0}}}
             config.write_text(yaml.safe_dump(settings))
+            if reuse:
+                prior = base/'previous case'
+                original = prior/'inputs/merged_hunks/original'
+                original.mkdir(parents=True)
+                (original/'sentinel.patch').write_text('frozen group')
+                (prior/'inputs/hunk_groups.json').write_text(json.dumps({'groups':[], 'excluded_hunks':[0]}))
+                (prior/'config.yml').write_text(yaml.safe_dump(settings))
+                candidate = base/'failed candidate.patch'
+                candidate.write_text('complete candidate')
+                settings.update(repair_from=str(candidate), reuse_case=str(prior))
+                config.write_text(yaml.safe_dump(settings))
             curl = bin_dir / 'curl'
             curl.write_text('#!/usr/bin/env sh\nprintf 200\n')
             curl.chmod(0o755)
             stub = '''from pathlib import Path
 import json,os,sys,yaml
 name=Path(__file__).name
+if name in ('summarize_and_group.py', 'triage.py', 'map_semantics.py'):
+ assert json.loads(os.environ['FRONTEND_OPTIONS']) == json.loads(os.environ['EXPECTED_FRONTEND'])
 with open(os.environ['STAGE_AUDIT'],'a') as log: log.write(json.dumps([name,sys.argv[1:]])+'\\n')
 args=sys.argv[1:]
 if name=='summarize_and_group.py': Path(args[1]).write_text('[]')
@@ -68,6 +85,9 @@ elif name=='backporting.py':
  config=yaml.safe_load(Path(args[1]).read_text())
  assert Path(config['merged_hunks_dir']).is_dir()
  assert json.loads(Path(config['hunk_groups']).read_text())['excluded_hunks']==[0]
+ if config.get('repair_from'):
+  assert args[args.index('--repair-from')+1]==config['repair_from']
+  assert (Path(config['merged_hunks_dir'])/'sentinel.patch').read_text()=='frozen group'
  (Path(config['patch_dataset_dir'])/'complete.patch').write_text('partial artifact\\n')
  raise SystemExit(int(os.environ['GENERATION_FIXTURE_RC']))
 elif name=='chain_check.py': raise SystemExit(int(os.environ['CHAIN_FIXTURE_RC']))
@@ -84,15 +104,21 @@ elif name=='chain_check.py': raise SystemExit(int(os.environ['CHAIN_FIXTURE_RC']
                    'ENABLE_TRIAGE': '1', 'STOP_AFTER_EXPORT': '0', 'STAGE_AUDIT': str(audit),
                    'GENERATION_FIXTURE_RC': str(generation_rc), 'CHAIN_FIXTURE_RC': str(chain_rc),
                    'LLM_BASE_URL': 'http://127.0.0.1:9', 'LLM_ENDPOINT': 'http://127.0.0.1:9/models',
+                   'EXPECTED_FRONTEND': json.dumps(settings.get('frontend', {})),
                    'PATH': str(bin_dir) + os.pathsep + os.environ['PATH']}
             for key in ('DEEPSEEK_MODEL', 'LLM_MODEL', 'COVERAGE_MODEL', 'SUMMARY_MODEL', 'GROUP_MODEL',
-                        'TRIAGE_MODEL', 'MAP_MODEL', 'DEEPSEEK_API_KEY', 'LLM_KEY', 'CHAIN_CHECK_SCRIPT'):
+                        'TRIAGE_MODEL', 'MAP_MODEL', 'DEEPSEEK_API_KEY', 'LLM_KEY', 'CHAIN_CHECK_SCRIPT', 'FRONTEND_OPTIONS'):
                 env.pop(key, None)
             if configured:
                 env.pop('LLM_BASE_URL')
             result = subprocess.run(['bash', str(RUNNER), 'configured-project', 'configured-case'],
                                     env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, generation_rc or chain_rc, result.stdout + result.stderr)
+            if reuse:
+                calls = [json.loads(line)[0] for line in audit.read_text().splitlines()]
+                self.assertEqual(calls, ['backporting.py', 'chain_check.py', 'make_verdict.py'])
+                self.assertTrue((case/'inputs/reuse.json').is_file())
+                return
             self.assertEqual((out / 'complete.patch').read_text(), 'partial artifact\n')
             self.assertFalse((out / 'config.used.yml').exists())
             stages = [json.loads(line)[0] for line in audit.read_text().splitlines()]
