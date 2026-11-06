@@ -265,7 +265,8 @@ def evaluate_global_artifact(
             status_data.setdefault('local_heuristic_complete', status_data.get('complete', False))
             status_data['complete'] = status_data['global_covered']
             status_data['coverage_method'] = global_cov['method']
-            status_data['missing_hunks'] = [i for i in members if not coverage_by_idx.get(i, False)]
+            status_data['missing_hunks'] = [i for i in members if i in global_cov['missing']]
+            status_data['unreviewed_hunks'] = [i for i in members if i in global_cov.get('unreviewed', [])]
             status_data['semantic_members'] = [m for m in global_cov['members'] if m['idx'] in members]
         with open(status_file, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(status_data, fh, ensure_ascii=False, indent=2)
@@ -289,6 +290,8 @@ def evaluate_global_artifact(
         json.dump(global_result, fh, ensure_ascii=False, indent=2)
     if global_cov["missing"]:
         logger.error("Global coverage missing hunks: %s" % global_cov["missing"])
+    if global_cov.get('unreviewed'):
+        logger.error("Global semantic review unavailable for hunks: %s" % global_cov['unreviewed'])
     if chain_rc != 0:
         logger.error("Global API chain validation failed; see %s" % chain_path)
     return global_complete, global_result
