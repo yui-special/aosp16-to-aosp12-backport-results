@@ -48,23 +48,89 @@ environments, backups and secrets are intentionally excluded.
    during grouping.
 5. `map_semantics.py` searches the target tree using contract terms, generic
    rename variants and surrounding code evidence, then maps each hunk to
-   concrete existing target locations.
+   concrete existing target locations. Exact old scopes with resolvable types
+   are located mechanically even when the summary lists prerequisite claims;
+   those claims remain explicitly unverified for porting and semantic review.
+   Other mappings receive parsed candidate method signatures and ranges.
 6. `build_v6_export.py` writes one merged patch per group containing direct /
    renamed / moved / split / unresolved locations, semantic obligations and
    explicit handling rules.
 7. PortGPT opens one session per group, applies/validates the group result,
-   checks coverage, and accumulates successful groups.
+   checks coverage, and accumulates successful groups. Existing symbol-query
+   results and mapped method source are shared only at the same immutable Git
+   revision. Missing upstream test classes do not remove behavior-test obligations.
 8. `chain_check.py` checks changed call signatures and `make_verdict.py`
    produces the final case verdict.
 
-Dependency closure does not use summary symbol names. Tree-sitter proves scoped
-parameter dependencies and unambiguous Java type-import uses; shadowed names,
-wildcard/static imports and unsupported syntax require semantic review. Changed
-statements include unchanged receivers and assertion context. The model reviews
-all original hunks and supplies quotes from both sides of each dependency.
+Candidate tree reconstruction first applies the original diff, falling back to
+`--recount` only on failure: unconditional recounting misreads traditional multi-file
+diffs. Recoverable candidate-inspection errors return diagnostics to the current
+group after rollback. Semantic-review retries retain valid hunk decisions, including
+when another hunk has an invalid resolution of a prior finding. The judge receives
+per-hunk witness/resolution requirements and its remaining invalid records to correct.
+Retries retain registered evidence cited by those invalid records, including cross-file
+evidence; unknown IDs remain invalid. If scope expansion leaves the candidate, pending
+obligations and evidence unchanged after an `unreviewed` response, review returns
+`stop_reason: no_progress` with the unresolved decisions. An identical invalid response
+at the same evidence state also stops. Neither condition accepts the patch; new evidence
+and different corrections can continue, and transient provider failures remain retryable.
+Target mapping retains validated hunk mappings and retries only unresolved members.
+Source delivered in `KNOWN TARGET FACTS` is registered in the current session's existing
+source/API read tracking; omitted lines and other revisions remain unread.
+
+Summary, initial triage and target-mapping requests run independently with a
+configurable worker count. Results are published in original hunk/group order.
+Each stage keeps one `<output>.checkpoint.json` beside its existing output; only
+validated results are reusable. Failures preserve completed items and stop further
+dispatch once observed. In-flight successful requests are also retained. Resume
+keys include input content, immutable source revisions, model/request options,
+parser configuration and implementation hashes. Unresolved mappings are not cached.
+Initial triage reuse does not bypass the subsequent whole-patch dependency review.
+
+Configure these stages through `frontend` in the case YAML (see `src/example.yml`):
+`workers: 3`, `resume: true`, plus per-stage `summary`, `triage` and `mapping`
+overrides for `workers`, `resume`, `request_options` and `read_timeout`.
+The runner passes this object as `FRONTEND_OPTIONS`; existing stage-specific request
+option/timeout environment variables take precedence. Set `frontend.resume: false`
+for fresh stability experiments. Parallel execution does not apply to cumulative
+group porting, which still depends on preceding group commits.
+
+New summary responses must contain every contract field with its declared type.
+Behavioral hunks also require nonempty goal, behavior, enclosing role and obligations.
+Missing content triggers a retry of that hunk with schema feedback, then an explicit
+stage failure; it cannot become a successful empty contract. New validated lists
+are not truncated by the legacy normalizer. Target type lookup uses actual parsed
+declarations, including nested classes, rather than same-named files. A parse gap
+disables the direct-mapping shortcut; it does not establish target inapplicability.
+
+Dependency closure does not use summary symbol names. Mechanical prerequisites
+cover scoped parameters, unambiguous Java type imports used in types, calls or
+annotations, new declarations and same-owner method definitions, lexically bound
+old-to-new signature replacements and new-overload adaptations using an
+unqualified/`this`/`Owner.this` receiver with an unchanged argument prefix,
+and aconfig declaration cleanup after reference removal. Other receivers cannot
+prove which same-named method or overload a call targets and remain model-reviewed.
+Shadowed names, wildcard/static imports and unsupported syntax still
+require behavioral review. Changed statements include unchanged receivers and
+assertion context. The model reviews all original hunks only for additional
+behavior/control-flow prerequisites and supplies quotes from both sides of each
+new dependency; it cannot repeat, remove or reverse a locked mechanical edge.
+Grouping reuses those locked signature edges and asks the model to classify only
+the remaining call candidates, rather than running a second receiver-only rule.
+A deterministic reduction removes a reviewed edge only when another path preserves
+its reachability; mechanical and `retain_consumer` edges are never removed.
 Quotes and hunk coverage are validated, but this is not a proof of semantic
 equivalence. Reviewed dependencies are tied to the patch and source revisions;
-they impose ordering without automatically merging an entire API chain.
+they impose ordering without automatically merging an entire API chain. When an
+initially skipped consumer is required to complete a selected provider's fix,
+a proven overload adaptation or an evidenced model review marks the edge as
+`retain_consumer`; only those explicit edges can promote a skipped consumer,
+never a whole same-name/API component.
+A pure deletion of one aconfig flag declaration is decided mechanically as independent
+cleanup when another hunk removes the corresponding code reference; no triage model
+call is made. Target occurrence counts are retained as evidence. Such cleanup cannot
+become a prerequisite of the behavior fix. Other configuration changes remain subject
+to semantic review rather than being skipped by filename alone.
 
 Same-name skipped hunks carry `review_required` / `review_only_hunks` hints without
 changing their port decision. Explicit `excluded_hunks` survive grouping, export
@@ -90,6 +156,89 @@ the group's committed diff; whole-patch repairs are a later stage. Empty results
 remain in place. Each completed group is also printed to the log.
 `--only-group N` preserves the original group number. The generic runner copies
 the report into the results directory.
+
+`backporting.py -c CONFIG --repair-from COMPLETE.patch` skips group generation
+and enters the same whole-patch review, repair and validation flow. The candidate
+must be a complete patch against the configured target base. All selected upstream
+hunks are still reviewed; old reviews and validation checkpoints are not imported.
+Every full candidate is saved before checks as `merged_hunks/ported/latest-candidate.patch`,
+with its base ref and SHA-256 in `latest-candidate.json`. It can be passed to `--repair-from`
+with the same base/configuration. This checkpoint is explicitly unvalidated; acceptance
+still comes from the final validation artifacts and `validated-checkpoints/`.
+This mode enables cumulative validation automatically and cannot use `--only-group`.
+The generic case runner supports the same mode through `repair_from` (a complete
+candidate patch path) and `reuse_case` (an existing case directory containing
+`config.yml` and exported `inputs`). It checks the upstream commit and target base,
+copies only the exported group inputs, and skips the frontend stages. Results use
+the runner's normal per-run directory; separate replay wrappers are unnecessary.
+
+Test or PoC failures preserve successful results from earlier validation stages;
+they cannot mark a successful production build as failed. Test repair feedback
+resolves JVM traceback lines against the immutable candidate tree and includes
+the enclosing method and concrete calling test. Missing or ambiguous source and
+truncated scopes are explicit. These source facts do not diagnose the failure or
+justify weakening an assertion.
+Repair sessions also receive a read-only Git tree for the current complete candidate.
+All three source-query tools accept this tree, including files and methods absent
+from the base. Traceback excerpts identify their own validation tree and list the
+concrete call arguments plus preceding calls in source order; this does not prove
+execution order or type binding. Repair submissions are local diffs against this
+exact candidate tree. The program applies them in a private index and generates
+the complete replacement patch against the original base. Stale tree IDs, context
+relocation and apply conflicts are rejected atomically; prior changes and the
+checkout are preserved. A rejected submission can be corrected within the same
+session. The exported/replay patch remains a complete patch.
+
+Compiler feedback retains diagnostic continuation lines (`symbol`, `location`,
+`required`, `found`, and `reason`) and includes candidate source around resolvable
+error locations. Explicit disk-full, missing-command, DNS and device-offline
+failures stop code repair and retain the candidate as unvalidated; unknown failures
+are not automatically classified as infrastructure failures.
+
+Source-read budgets are checked before Git searches or parsing. `locate_symbol`
+and `find_references` accept a literal file path that restricts the search itself.
+Their `symbol` argument rejects source filenames and paths before Git lookup;
+`Example.java` is not interpreted as the identifier `java`. Invalid input returns
+`invalid_query` with `searched: false`, not an empty search result. Use a code symbol
+such as `Example.method` and put a known file location in `path`.
+A unique small definition includes its source. Source already supplied by failure
+feedback or tools is tracked per session, immutable ref, path and line; subsequent
+reads return only new complete lines and identify omitted/truncated ranges. A new
+session starts a new ledger, so evidence from an earlier session is never hidden.
+`locate_symbol` supplies declarations; `find_references` supplies calls and exact
+identifier occurrences for constants, fields and local variables, with source lines
+and enclosing ranges. It does not repeat the declaration inventory. Lexical matches
+do not prove receiver or variable binding; unparsed text is reported separately.
+Missing paths, parser gaps and scoped zero matches are distinct. Searches never
+silently widen a requested path. Repair prompts require a concrete missing fact
+for each query and trace assertions through helper arguments, defaults, shared mocks
+and production branches. Test isolation must be repaired rather than hidden by
+reordering scenarios or weakening their assertions. Unlimited mode remains available.
+
+Semantic repair feedback separates `upstream_location` (the source obligation) from
+`target_locations` (verified candidate excerpts). An absent upstream filename is not
+an instruction to find or create a same-named target file. Findings without target
+evidence explicitly keep their location unresolved.
+
+Summary generation and final review read complete post-change upstream functions
+through Tree-sitter, joining setup and assertion hunks in the same scope. Those
+immutable source facts take precedence over a hunk-local interpretation. The final
+judge receives these functions directly instead of trusting generated summaries.
+Acceptance of a test scenario requires a `test_witnesses` entry linking setup,
+exercised call and assertion to exact upstream and candidate source quotations.
+Mixed hunks can explicitly mark upstream-only mechanical test scopes inapplicable,
+with a quoted obligation, reason and target evidence; matching class names are not required.
+The program verifies those anchors; cross-version behavioral equivalence remains
+a semantic judgment, not something proved by an evidence ID or a matching test name.
+
+A previously missing obligation needs an explicit `resolution` before acceptance.
+The program rejects claimed code fixes whose cited source is unchanged and claimed
+new evidence that was already supplied. Corrections of an earlier interpretation
+must be explained explicitly and still satisfy the test-witness requirements.
+Reviews use `coverage_temperature` (default `0.0`) independently of generation;
+this reduces sampling variability without promising deterministic model judgments.
+If a test compiler repair reveals a coverage gap, repair returns to the coverage
+stage using the latest findings before any further full validation.
 
 Grouping has no numerical hunk cap. The model reviews each changed signature and
 each local scope separately, then reviews cross-scope references and test behavior.
@@ -128,6 +277,11 @@ matching names/arity and assignment references remain candidates requiring revie
 not a resolved type graph. Old summaries and E1–E4 keyword edges are not supplied
 as grouping evidence. New or changed test assertions require their actual behavior
 implementation; adapting an old call alone does not require every later guard.
+A call changed in the same hunk from the old signature to the new signature with
+the same receiver and argument prefix is a mechanical binding and cannot be
+rejected by the grouping model. Multi-hunk local units require connected source
+bindings or a fixed test/private-overload contract; sharing a scope or making
+parallel formatting changes is not sufficient.
 Confirmed relations and signature reviews are saved in group details, with their
 source anchors in `grouping_anchors`. Source
 evidence also accompanies group exports.
@@ -149,6 +303,14 @@ Final whole-patch validation pins the original target commit. Every candidate is
 a complete replacement patch, applied atomically on that clean base; only hunk
 line counts may be recounted. Context is never force-rewritten in final validation,
 and reconstruction never falls back to applying a candidate on the cumulative branch.
+When production-code and test-coverage findings coexist, final repair runs sequential
+production then test-coverage sessions. Each session receives the latest complete
+candidate and must submit a revised complete patch; a read-only session ends with
+`REPAIR_NO_CANDIDATE`. A session whose own findings remain ends with
+`REPAIR_STAGE_INCOMPLETE` and cannot advance to the next stage or final acceptance.
+If semantic findings are resolved but the latest test build/runtime validation fails,
+up to two consecutive `test_validation` sessions receive that concrete feedback and
+the latest complete candidate before final acceptance.
 
 ## Status of the three requested mechanisms
 
@@ -171,22 +333,51 @@ and reconstruction never falls back to applying a candidate on the cumulative br
    "need not ported" without concrete target-code evidence.
 6. **Final-patch global validation: implemented.** After all group sessions,
    every selected hunk is reviewed against the final composed patch, including
-   no-change claims. A tool-using collector gathers candidate-code evidence;
-   a separate tool-free judge classifies each obligation as satisfied,
-   inapplicable, or missing. The judge receives the evidence registry and tool trace.
+   no-change claims. A deterministic builder gathers candidate structure, source
+   ranges and symbol searches from an immutable Git tree. Exact post-change text
+   matches are source-location evidence, not automatic acceptance: identical blocks
+   can belong to different methods or guards. A separate tool-free judge classifies
+   the obligations as satisfied, inapplicable, missing, or unreviewed when context is insufficient.
+   The judge receives the deterministic evidence and source/search registry.
+   Overlapping source ranges share one excerpt; search records are referenced by ID
+   rather than repeated. Truncated scopes carry their full boundaries and omitted line
+   ranges. An unreviewed decision citing such a scope triggers deterministic expansion
+   within the review retry budget; unavailable context is not a code-repair finding.
    JSON wrappers are parsed directly. Explicit per-hunk prose verdicts are converted
    locally, without a formatter model call. Ambiguous decisions require another judge
-   response; original explanations and evidence IDs are retained.
-   Citations are checked against an immutable Git tree built with a private
-   index, without changing the working tree. Identifier overlap remains a
-   diagnostic and cannot grant acceptance. Earlier groups may satisfy later
-   obligations; upstream names do not have to survive an equivalent backport.
-   Each complete candidate is compiled and tested before semantic acceptance.
-   Review outages retain the candidate and do not suppress build/test or repair
-   of concrete compilation, test, API-chain or semantic findings. An unavailable
-   review alone cannot justify rewriting code or accepting the patch. Review
-   responses, tool traces, normalization attempts and errors are saved by stage
-   under `coverage-review/`, bound to the candidate tree and patch hash, with keys redacted.
+   response; original explanations and evidence IDs are retained. String evidence IDs
+   are normalized locally and must resolve exactly to a registered record. Search evidence
+   may support missing or inapplicable decisions, never a satisfied decision.
+   Decisions are validated per hunk: valid findings survive malformed neighboring rows,
+   and retries request only unresolved hunks. Retry evidence is limited to their paths,
+   search/source references, and related changed signatures/calls/helpers. The complete
+   candidate diff remains available for cross-file context; unrelated source excerpts
+   and structure records are omitted explicitly. Returned evidence IDs must belong to
+   the registry actually supplied in that request.
+   `missing` lists concrete gaps; `unreviewed` lists unavailable decisions. Both prevent
+   acceptance, but only concrete findings are sent to code repair.
+   Citations are checked against the immutable tree built with a private index,
+   without changing the working tree. Structural checks, API inventories, evidence
+   extraction and the judge use the applied candidate tree and a Git
+   diff from the original base to that candidate tree, so accepted patch offsets and
+   recounted hunk lengths cannot invalidate source coordinates. The submitted patch
+   and canonical diff are retained together in the evidence audit record.
+   Identifier overlap remains a diagnostic and
+   cannot grant acceptance. Earlier groups may satisfy later obligations; upstream
+   names do not have to survive an equivalent backport. Intermediate candidates
+   complete semantic/API checks without build/test. One recorded `submit_candidate` ends the
+   repair invocation, even if the model requested additional tools in that response.
+   The controller selects subsequent repair stages and directly runs build/test/PoC
+   after semantic checks pass; the repair model has no `validate` tool. Build/test
+   failures return to repair with fresh diagnostics. Production and test stages
+   receive separate retry budgets; regressions can return to production within a
+   bounded category-switch budget. Failed candidate trees are not rebuilt solely
+   because diff formatting changed. Review outages retain the candidate
+   and do not suppress build/test or repair of concrete compilation, test, API-chain
+   or semantic findings. An unavailable review alone cannot justify rewriting code
+   or accepting the patch. Review responses, deterministic evidence records,
+   normalization attempts and errors are saved by stage under `coverage-review/`,
+   bound to the candidate tree and patch hash, with keys redacted.
    Evidence from another candidate tree is never reused. The same tree runs `chain_check.py`; results are
    written to `global-validation.json` and per-group status files receive
    `global_covered`, `global_api_chain_ok` and `global_validation_complete`.
@@ -202,6 +393,14 @@ to the subsequent mapping stage. Original triage decisions are retained in JSON.
 
 ## Configuration
 
+`unlimited_backend: true` enables an experiment without backend model iteration,
+source-read count/character, stale-query, repair retry, category-switch or semantic
+review retry budgets. The default is `false`. Effective limits are logged as
+`BACKEND_LIMITS`; null means unlimited. Source deduplication, fixed-tree context
+checks, no-progress detection and validation acceptance remain active. Compilation,
+test and network request timeouts remain execution settings. Permanent provider
+rejections (including authentication or insufficient balance) still stop review.
+
 The real server configuration was not copied because it contained a live API
 key. Use the included `src/example.yml` and each dataset's `config.yml` to
 recreate a local configuration. Never commit `.env`, `config.yml` containing a
@@ -209,9 +408,16 @@ real key, tokens or logs containing request headers.
 
 Generation configuration accepts `coverage_model` (defaults to the generation
 model), `llm_timeout_seconds` (300), `llm_max_retries` (1),
-`coverage_review_iterations` (20), `coverage_review_retries` (1), and
-`final_repair_iterations` (20). `coverage_retries` (0) controls only the legacy
-per-group heuristic retry; the final evidence review always runs.
+`coverage_review_retries` (1), and `final_repair_iterations` (20).
+`final_repair_retries` (2) bounds retries in each repair stage and retries after
+failed full validation. `final_repair_category_switches` (2) bounds returns from
+test repair to production repair. API context reads are tracked per inventory
+record across pages and filters. Oversized records remain unread until their
+complete source range is delivered at the inventory's fixed Git ref; truncated
+or suppressed tool output does not satisfy required reads.
+`coverage_review_iterations` remains accepted for configuration compatibility but
+is unused now that evidence generation is deterministic. `coverage_retries` (0)
+controls only the legacy per-group heuristic retry; the final evidence review always runs.
 
 Relevant optional environment variables:
 
@@ -276,7 +482,25 @@ the applied candidate's files with untouched callers at its exact base. The
 `Class.method`, `Class::method` and `Class#method`; other owners remain explicit
 candidates instead of fuzzy name substitutions.
 These are syntax candidates, not a type-resolved call graph; renamed APIs still
-require semantic mapping. Parse gaps remain explicit.
+require semantic mapping. Parse gaps remain explicit. Enclosing functions seed a
+whole-repository inventory only when they are changed APIs or explicit target
+mappings, so a generic anonymous `run` method is not expanded across the tree.
+
+Initial group prompts include the inventory manifest, compact signature changes,
+a required-read checklist and complete small per-symbol inventories within
+`context_inline_chars` (default 6000; 0 disables inline delivery). Rendering a prompt
+does not complete reads: the executor records inline delivery when invoking the
+session. No partial symbol inventory is marked complete. Remaining records use the
+`query_api_context` tool can read only the current group's artifact; it accepts
+no artifact or filesystem path and provides bounded, paginated definitions and
+references filtered by symbol, exact path/scope and argument count. Before
+editing, the model must query every non-inlined symbol with `record_type=all`;
+`validate` rejects missing required reads. It must then inspect every concrete
+edit site with `viewcode` at the current cumulative ref and recheck candidate
+API facts after signature changes. Required-read completion is saved in each
+group status. YAML `context_query_limit` (default 10, maximum 20) and
+`context_query_chars` (default 24000, minimum 2000) bound each response without
+cutting a JSON record in half.
 
 `src/tools/porting_context.py` keeps one actual committed diff per cumulative group.
 Later groups receive an index of all prior changes plus complete relevant hunks,
