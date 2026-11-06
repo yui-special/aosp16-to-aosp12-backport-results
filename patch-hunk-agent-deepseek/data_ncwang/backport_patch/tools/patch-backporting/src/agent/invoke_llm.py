@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -12,6 +13,7 @@ import httpx
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.callbacks import FileCallbackHandler
+from langchain_core.agents import AgentFinish, AgentStep
 from langchain_openai import ChatOpenAI
 
 from agent.prompt import (
@@ -25,10 +27,10 @@ from agent.prompt import (
 from tools.logger import logger
 from tools.group_report import GroupComparison
 from tools.project import (Project, FinalValidationUnavailable, create_find_references_tool,
-                           create_query_api_context_tool)
-from tools.source_checks import ApiCatalog
+                           create_query_api_context_tool, create_submit_candidate_tool)
+from tools.source_checks import ApiCatalog, artifact_tree
 from tools.porting_context import ApiContext, ChangeLedger, QueryProgress, execution_result, target_context
-from agent.coverage import CoverageReviewer
+from agent.coverage import CoverageReviewer, repair_findings, is_test_source
 from tools.utils import (
     dump_merged_hunks,
     group_patch,
@@ -39,7 +41,59 @@ from tools.utils import (
 )
 
 
-def build_llm(data):
+class CandidateRepairExecutor(AgentExecutor):
+    """End a synchronous repair invocation as soon as one candidate is submitted.
+
+    LangChain's multi-action agent rejects return_direct tools. Stop consuming its
+    step iterator instead, so later calls in the same model response cannot run.
+    """
+    def _take_next_step(self, name_to_tool_map, color_mapping, inputs,
+                        intermediate_steps, run_manager=None):
+        steps = []
+        for step in self._iter_next_step(name_to_tool_map, color_mapping, inputs,
+                                        intermediate_steps, run_manager):
+            if (isinstance(step, AgentStep) and step.action.tool == 'submit_candidate'
+                    and not str(step.observation).startswith('CANDIDATE_SUBMISSION_INVALID:')):
+                return AgentFinish({'output': step.observation}, str(step.observation))
+            steps.append(step)
+        return self._consume_next_step(steps)
+
+
+def _is_test_coverage_finding(member):
+    return is_test_source(member.get('file', ''))
+
+
+def _repair_feedback_stages(validate_ret, findings, production_required):
+    test_findings = [m for m in findings if _is_test_coverage_finding(m)]
+    if not test_findings:
+        if not production_required:
+            return [('test_validation', validate_ret + (
+                '\nCURRENT STAGE: repair the reported test/PoC failure using the current '
+                'candidate and failure locations. Compilation already passed. '
+                'Submit the local diff against candidate_ref (the program records the complete replacement patch) through submit_candidate.\n'))]
+        return [('complete', validate_ret)]
+    if not production_required:
+        return [('test_coverage', validate_ret + (
+            '\nCURRENT STAGE: repair only the remaining test-coverage gaps. '
+            'Do not revisit unrelated production changes. Submit a local diff against candidate_ref (the program records the complete replacement patch) '
+            'through submit_candidate for intermediate checks. After semantic checks pass, '
+            'stop this session; the orchestrator will run final build/test/PoC.\n'))]
+    production_feedback = validate_ret + (
+        '\nCURRENT STAGE: repair production-code completeness only. '
+        'Do not investigate or modify test-coverage gaps in this stage; they have a later stage. '
+        'Submit the local diff against candidate_ref (the program records the complete replacement patch) through submit_candidate. '
+        'Build and tests are deferred until all known repair stages finish.\n')
+    test_feedback = (
+        'The production-code stage submitted a new complete candidate. '
+        'CURRENT STAGE: repair only the remaining test-coverage gaps below. '
+        'Do not revisit unrelated production changes. Submit a local diff against candidate_ref (the program records the complete replacement patch) through '
+        'submit_candidate for intermediate checks. After semantic checks pass, stop this session; '
+        'the orchestrator will run final build/test/PoC.\n'
+        + json.dumps({'test_coverage_findings': repair_findings(test_findings)}, ensure_ascii=False))
+    return [('production', production_feedback), ('test_coverage', test_feedback)]
+
+
+def build_llm(data, *, temperature=None):
     """按配置构造 LLM 客户端（与是否分组无关）。"""
     request_options = {}
     if getattr(data, 'llm_timeout_seconds', None) is not None:
@@ -63,7 +117,7 @@ def build_llm(data):
             transport=httpx.HTTPTransport(local_address="0.0.0.0",
                                           verify=_ssl_ctx or True)
         )
-    _temp = float(os.environ.get("LLM_TEMPERATURE", "0.5"))
+    _temp = float(os.environ.get("LLM_TEMPERATURE", "0.5")) if temperature is None else temperature
     llm = ChatOpenAI(
         temperature=_temp,
         model=model_name,
@@ -427,6 +481,9 @@ def do_backport(
     cumulative = bool(getattr(data, "cumulative", False))
     cum_base = getattr(data, "cum_base", "") or ""
     project.full_patch_base = cum_base or None
+    repair_candidate = getattr(data, 'repair_candidate', None)
+    if repair_candidate is not None and (not cumulative or not repair_candidate.strip()):
+        raise ValueError('Candidate replay requires cumulative mode and a nonempty complete patch')
 
     # 输入有两种来源（优先用「已经合并好的文件」）：
     #   1) merged_hunks 目录里的 *.patch —— 每个文件就是一组已经合并好的 hunk，
@@ -469,6 +526,7 @@ def do_backport(
         )
 
     project.checkpoint_dir = os.path.join(ported_dir, "validated-checkpoints")
+    project.candidate_checkpoint_dir = ported_dir
     os.makedirs(project.checkpoint_dir, exist_ok=True)
 
     if not merged_hunks:
@@ -485,7 +543,7 @@ def do_backport(
         "Backporting %d of %d merged hunk(s): indices %s"
         % (len(selected), len(merged_hunks), [i for i, _ in selected])
     )
-    group_comparison = GroupComparison(ported_dir, selected, logger)
+    group_comparison = GroupComparison(ported_dir, selected, logger) if repair_candidate is None else None
 
     # 组内成员 hunk 的原文，用来做「这一组是否被完整移植」的机械校验
     _, all_hunks = split_patch_indexed(patch, True)
@@ -497,13 +555,23 @@ def do_backport(
     # [C] 跨组共享变更账本：后面的组能看到前面各组「实际产出了什么」。
     # 各组会话独立；累积模式中的源码已包含前面组的提交。
     ledger = ChangeLedger(int(getattr(data, "ledger_chars", 6000)))
-    catalog = ApiCatalog(project.source_index, data.new_patch_parent, data.new_patch, all_hunks)
+    catalog = (ApiCatalog(project.source_index, data.new_patch_parent, data.new_patch, all_hunks)
+               if repair_candidate is None else None)
 
     all_groups_complete = True
     selected_hunks = set()
     accepted_need_not_ported = set()
     any_strict_requires_patch = False
-    for gpos, group in selected:
+    if repair_candidate is not None:
+        selected_hunks = {int(i) for _, group in selected for i in group.get('hunks', [])}
+        any_strict_requires_patch = any(group.get('strict_requires_patch', False) for _, group in selected)
+        logger.info('REPLAY_COMPLETE_CANDIDATE: skipping group generation; reviewing %d upstream hunks',
+                    len(selected_hunks))
+        with open(os.path.join(ported_dir, 'replay-input.json'), 'w', encoding='utf-8') as handle:
+            json.dump(dict(base=project.repo.git.rev_parse(cum_base or data.target_release),
+                           patch_sha256=hashlib.sha256(repair_candidate.encode('utf-8', 'surrogateescape')).hexdigest(),
+                           selected_hunks=sorted(selected_hunks)), handle, indent=2)
+    for gpos, group in ([] if repair_candidate is not None else selected):
         pp = group["text"]
         members = group["hunks"] or ["?"]
         group_tag = "merged hunk %d (original hunks %s, group %s)" % (
@@ -776,7 +844,9 @@ def do_backport(
     project.all_hunks_applied_succeeded = all_groups_complete
     logger.info(f"Aplly all hunks in the patch      PASS")
     project.now_hunk = "completed"
-    if cumulative and cum_base:
+    if repair_candidate is not None:
+        complete_patch = repair_candidate
+    elif cumulative and cum_base:
         # 累积模式下，各组已经提交到分支；最终产物 = base..HEAD 的 diff
         project.repo.git.reset("--hard")
         # 用分支名而不是 HEAD：模型在会话里用 viewcode 看过别的 ref 时，HEAD 可能
@@ -815,16 +885,18 @@ def do_backport(
     # Review each candidate after its build/test attempt, and again after the
     # validated artifact is rebuilt. Review outages must not skip compilation.
     validation_base = project.repo.git.rev_parse(cum_base or data.target_release)
-    review_llm = llm
+    review_temperature = getattr(data, 'coverage_temperature', 0.0)
+    review_llm = llm.bind(temperature=review_temperature) if llm is not None else None
     if getattr(data, 'coverage_model', None) and data.coverage_model != getattr(data, 'llm_model', None):
         review_data = copy(data)
         review_data.llm_model = data.coverage_model
-        review_llm = build_llm(review_data)
+        review_llm = build_llm(review_data, temperature=review_temperature)
     project.coverage_reviewer = CoverageReviewer(
         review_llm, project.dir, validation_base,
         max_iterations=getattr(data, 'coverage_review_iterations', 20),
-        retries=getattr(data, 'coverage_review_retries', 1),
-        artifact_dir=os.path.join(ported_dir, 'coverage-review'))
+        retries=None if getattr(data, 'unlimited_backend', False) else getattr(data, 'coverage_review_retries', 1),
+        artifact_dir=os.path.join(ported_dir, 'coverage-review'),
+        upstream_parent=data.new_patch_parent, upstream_commit=data.new_patch)
 
     def final_artifact_check(candidate):
         # The same check protects acceptance of every compiled repair candidate.
@@ -835,14 +907,26 @@ def do_backport(
             complete, report = evaluate_global_artifact(
                 project, candidate, artifact.name, ported_dir, hunks_by_idx,
                 selected_hunks, accepted_need_not_ported, any_strict_requires_patch, cumulative)
+        project.latest_candidate_patch = candidate
+        project.latest_candidate_tree = report['coverage'].get('candidate_tree')
+        project.final_validation_api_failed = report['api_chain_rc'] == 1
         review_failed = report['coverage']['method'] == 'semantic_review_failed'
+        project.final_validation_findings = [m for m in report['coverage']['members']
+            if not m.get('covered') and (not review_failed or m.get('status') == 'missing')]
         chain_failed = report['api_chain_rc'] not in (0, 1)
         if review_failed or chain_failed:
             unavailable, findings = [], []
             if review_failed:
                 unavailable.append('Semantic review: ' + str(report['coverage'].get('error')))
+                if project.final_validation_findings:
+                    findings.append('SEMANTIC_VALIDATION_FAILED: ' + json.dumps({
+                        'members': repair_findings(project.final_validation_findings),
+                        'missing': [m['idx'] for m in project.final_validation_findings],
+                        'unreviewed': report['coverage'].get('unreviewed', []),
+                    }, ensure_ascii=False))
             elif not report['coverage']['complete']:
-                findings.append('SEMANTIC_VALIDATION_FAILED: ' + json.dumps(report['coverage'], ensure_ascii=False))
+                findings.append('SEMANTIC_VALIDATION_FAILED: ' + json.dumps(dict(report['coverage'],
+                    members=repair_findings(report['coverage']['members'])), ensure_ascii=False))
             if chain_failed:
                 unavailable.append('API check could not run: ' + report['api_chain_report'])
             elif report['api_chain_rc'] == 1:
@@ -852,7 +936,7 @@ def do_backport(
             return ''
         return 'SEMANTIC_VALIDATION_FAILED: ' + json.dumps({
             'missing': report['coverage']['missing'],
-            'members': [m for m in report['coverage']['members'] if not m['covered']],
+            'members': repair_findings([m for m in report['coverage']['members'] if not m['covered']]),
             'review_error': report['coverage'].get('error'),
             'api_chain': report['api_chain_report'],
         }, ensure_ascii=False)
@@ -877,6 +961,11 @@ def do_backport(
     project.context_mismatch_times = 0
     project.full_patch_base = validation_base
     validate_ret = project._validate(validation_base, complete_patch)
+    project.latest_validation_result = validate_ret
+    if getattr(project, 'validation_infrastructure_failure', None):
+        logger.error('VALIDATION_INFRASTRUCTURE_FAILURE: retaining candidate; code repair not started: %s',
+                     project.validation_infrastructure_failure)
+        return
     if project.final_validation_unavailable and not project.final_repair_required:
         logger.error('Backport INCOMPLETE: build/test passed, but final validation is unavailable. '
                      'Candidate retained; no concrete code defect was found to send for repair.')
@@ -901,35 +990,190 @@ def do_backport(
         ]
     )
     # XXX maybe refactor initial_agent function to cover
-    project.query_progress = QueryProgress(project.query_stale_limit)
-    viewcode, locate_symbol, validate, _, _ = project.get_tools()
-    tools = [viewcode, locate_symbol, validate, create_find_references_tool(project)]
+    unlimited = getattr(data, 'unlimited_backend', False)
+    project.unlimited_backend = unlimited
+    stale_limit = None if unlimited else project.query_stale_limit
+    project.query_progress = QueryProgress(stale_limit)
+    project.final_repair_read_limit = None if unlimited else 40000
+    viewcode, locate_symbol, _, _, _ = project.get_tools()
+    tools = [viewcode, locate_symbol, create_find_references_tool(project),
+             create_submit_candidate_tool(project)]
     agent = create_tool_calling_agent(llm, tools, prompt)
-    agent_executor = AgentExecutor(
+    agent_executor = CandidateRepairExecutor(
         agent=agent, tools=tools, verbose=True,
-        max_iterations=getattr(data, 'final_repair_iterations', 20)
+        max_iterations=None if unlimited else getattr(data, 'final_repair_iterations', 20)
     )
-    try:
-        agent_executor.invoke(
-            {
-                "project_url": data.project_url,
-                "new_patch_parent": data.new_patch_parent,
-                "target_release": validation_base,
-                "new_patch": patch,
-                "complete_patch": complete_patch,
-                "compile_ret": validate_ret,
-            },
-            {"callbacks": [log_handler]},
-        )
-    except Exception as e:  # noqa: BLE001
-        if project.poc_succeeded:
-            logger.warning(
-                "Final repair session ended with %s after a validated patch was saved; "
-                "using the validated checkpoint." % type(e).__name__
-            )
-        else:
-            logger.error("Final repair session failed: %s: %s" % (type(e).__name__, e))
+    findings = getattr(project, 'final_validation_findings', [])
+    production_required = (not project.compile_succeeded or any(
+        not _is_test_coverage_finding(m) for m in findings))
+    stages = _repair_feedback_stages(validate_ret, findings, production_required)
+    retry_limit = None if unlimited else getattr(data, 'final_repair_retries', 2)
+    switch_limit = None if unlimited else getattr(data, 'final_repair_category_switches', 2)
+    logger.info('BACKEND_LIMITS %s', json.dumps(dict(unlimited_backend=unlimited,
+        iterations=None if unlimited else getattr(data, 'final_repair_iterations', 20), repair_retries=retry_limit,
+        category_switches=switch_limit, stale_queries=stale_limit,
+        query_characters=project.final_repair_read_limit,
+        coverage_review_retries=None if unlimited else getattr(data, 'coverage_review_retries', 1))))
+    last_stage, stage_attempts = None, 0
+    validation_failures = 0
+    category_switches = 0
+
+    def candidate_key(candidate):
+        return getattr(project, 'latest_candidate_tree', None) or hashlib.sha256(
+            candidate.encode('utf-8', 'surrogateescape')).hexdigest()
+
+    # The initial full validation has already run. Do not rebuild an unchanged
+    # artifact merely because a model rewrote its diff formatting or verdict.
+    validated_candidates = {candidate_key(complete_patch)}
+    while stages:
+        stage, feedback = stages.pop(0)
+        if stage != last_stage:
+            last_stage, stage_attempts = stage, 0
+        if retry_limit is not None and stage_attempts >= retry_limit + 1:
+            logger.error('REPAIR_STAGE_INCOMPLETE stage=%s; repair budget exhausted' % stage)
             project.round_succeeded = False
+            return
+        stage_attempts += 1
+        previous = complete_patch
+        project.latest_candidate_patch = previous
+        project.candidate_submitted = False
+        project.full_validation_allowed = False
+        project.semantic_candidate_ready = False
+        agent_executor.max_iterations = None if unlimited else getattr(data, 'final_repair_iterations', 20)
+        if not unlimited and stage in {'test_coverage', 'test_validation'}:
+            agent_executor.max_iterations = max(30, agent_executor.max_iterations)
+        if stage == 'test_coverage':
+            current_test_findings = [m for m in getattr(project, 'final_validation_findings', [])
+                                     if _is_test_coverage_finding(m)]
+            feedback = getattr(project, 'latest_validation_result', feedback) + (
+                '\nCURRENT STAGE: repair every current test-coverage finding below; this supersedes '
+                'earlier finding lists. Submit a local diff against candidate_ref (the program records the complete replacement patch) through '
+                'submit_candidate. When semantic checks pass, stop this session without further '
+                'edits or tool calls; the orchestrator will run final build/test/PoC.\n'
+                + json.dumps({'test_coverage_findings': repair_findings(current_test_findings)}, ensure_ascii=False))
+        project.final_repair_reads_remaining = (None if unlimited else
+                                               max(4, agent_executor.max_iterations - 4))
+        try:
+            candidate_ref = artifact_tree(project.dir, validation_base, previous)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.error('CANDIDATE_SOURCE_UNAVAILABLE: retaining the unapplied candidate; '
+                         'local repair cannot run without a fixed source tree: %s', exc)
+            project.round_succeeded = False
+            return
+        project.repair_candidate_ref = candidate_ref
+        # Each invocation has a fresh message history. Deduplication must not hide
+        # source delivered only to a previous session.
+        project.query_progress = QueryProgress(stale_limit)
+        project.query_progress.seed_feedback(feedback)
+        try:
+            agent_executor.invoke(
+                {
+                    "project_url": data.project_url,
+                    "new_patch_parent": data.new_patch_parent,
+                    "target_release": validation_base,
+                    "new_patch": patch,
+                    "complete_patch": previous,
+                    "candidate_ref": candidate_ref,
+                    "compile_ret": feedback,
+                },
+                {"callbacks": [log_handler]},
+            )
+        except Exception as e:  # noqa: BLE001
+            if project.candidate_submitted:
+                logger.warning(
+                    "Final repair session ended with %s after candidate submission; "
+                    "processing the recorded candidate." % type(e).__name__
+                )
+            else:
+                logger.error("Final repair session failed during %s: %s: %s" % (
+                    stage, type(e).__name__, e))
+                project.round_succeeded = False
+                return
+        complete_patch = project.latest_candidate_patch
+        if not project.candidate_submitted:
+            logger.error("REPAIR_NO_CANDIDATE stage=%s; the agent submitted no complete patch" % stage)
+            project.round_succeeded = False
+            return
+        if project.final_validation_unavailable and not project.final_repair_required:
+            logger.error('REPAIR_VALIDATION_UNAVAILABLE: no concrete defect to repair')
+            project.round_succeeded = False
+            return
+        if project.semantic_candidate_ready and not project.final_repair_required:
+            key = candidate_key(complete_patch)
+            if key in validated_candidates:
+                logger.error('REPAIR_NO_PROGRESS: this candidate already failed full validation')
+                project.round_succeeded = False
+                return
+            validated_candidates.add(key)
+            # Full validation is an orchestration step, never another LLM session.
+            logger.info('Final candidate semantics passed; running build/test/PoC')
+            latest_result = project._validate(validation_base, complete_patch)
+            project.latest_validation_result = latest_result
+            if getattr(project, 'validation_infrastructure_failure', None):
+                logger.error('VALIDATION_INFRASTRUCTURE_FAILURE: retaining candidate without code retry: %s',
+                             project.validation_infrastructure_failure)
+                return
+            if project.poc_succeeded:
+                project.persist_validated_patch(complete_patch, validation_base)
+                break
+            if project.final_validation_unavailable and not project.final_repair_required:
+                logger.error('REPAIR_VALIDATION_UNAVAILABLE: full validation cannot be accepted')
+                project.round_succeeded = False
+                return
+            validation_failures += 1
+            if retry_limit is not None and validation_failures > retry_limit:
+                logger.error('REPAIR_VALIDATION_FAILED: full validation retry budget exhausted')
+                project.round_succeeded = False
+                return
+            findings = getattr(project, 'final_validation_findings', [])
+            if findings or not project.compile_succeeded:
+                stages = _repair_feedback_stages(latest_result, findings,
+                    not project.compile_succeeded or any(
+                        not _is_test_coverage_finding(m) for m in findings))
+            else:
+                stages = [('test_validation', latest_result + (
+                    '\nCURRENT STAGE: repair the reported test/PoC failure. '
+                    'Submit the local diff against candidate_ref (the program records the complete replacement patch) through submit_candidate.\n'))]
+            last_stage = None
+            continue
+        if complete_patch == previous:
+            logger.error('REPAIR_NO_PROGRESS stage=%s; unchanged candidate still has findings' % stage)
+            project.round_succeeded = False
+            return
+        current_findings = getattr(project, 'final_validation_findings', [])
+        production_remaining = [m for m in current_findings if not _is_test_coverage_finding(m)]
+        test_remaining = [m for m in current_findings if _is_test_coverage_finding(m)]
+        api_failed = getattr(project, 'final_validation_api_failed', False)
+        latest_result = getattr(project, 'latest_validation_result', validate_ret)
+        if stage in {'test_coverage', 'test_validation'} and (production_remaining or api_failed):
+            if switch_limit is not None and category_switches >= switch_limit:
+                logger.error("REPAIR_STAGE_INCOMPLETE stage=%s; production findings keep "
+                             "reappearing after test repair: %s" % (
+                                 stage, json.dumps(production_remaining, ensure_ascii=False)))
+                project.round_succeeded = False
+                return
+            production_feedback = latest_result + (
+                '\nCURRENT STAGE: test repair exposed production-code gaps. Repair only these '
+                'production findings now; the remaining test findings will be re-evaluated '
+                'afterward. Submit the local diff against candidate_ref (the program records the complete replacement patch) through submit_candidate.\n'
+                + json.dumps({'production_findings': repair_findings(production_remaining)}, ensure_ascii=False))
+            stages = [('production', production_feedback)]
+            category_switches += 1
+            continue
+        if stage == 'production' and not production_remaining and not api_failed and test_remaining:
+            stages = [('test_coverage', '')]
+            continue
+        if stage == 'test_validation' and test_remaining:
+            # A compiler repair can expose a coverage gap; route to the current kind
+            # of finding instead of asking another session to fix an obsolete test error.
+            stages = [('test_coverage', '')]
+            continue
+        remaining = (production_remaining if stage == 'production' else
+                     test_remaining if stage == 'test_coverage' else current_findings)
+        stages = [(stage, latest_result + (
+            '\nCURRENT STAGE: continue repairing only the unresolved %s findings below. '
+            'Use submit_candidate to submit the local diff against candidate_ref (the program records the complete replacement patch).\n%s\n' % (
+                stage, json.dumps({'unresolved_findings': repair_findings(remaining)}, ensure_ascii=False))))]
     if project.poc_succeeded:
         logger.info(
             f"Successfully backport the patch to the target release {data.target_release}"

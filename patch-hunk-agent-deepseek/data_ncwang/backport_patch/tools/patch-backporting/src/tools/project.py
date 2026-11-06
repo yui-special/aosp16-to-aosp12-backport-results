@@ -49,9 +49,11 @@ class Project:
         self.testcase_succeeded = False
         self.poc_succeeded = False
         self.checkpoint_dir = None
+        self.candidate_checkpoint_dir = None
         self.validated_patch_checkpoints = []
         self.full_patch_base = None
         self.validated_complete_patch = None
+        self.validation_candidate_tree = None
         self.source_index = SymbolIndex(self.dir)
         self.query_progress = None
         self.api_context = None
@@ -65,9 +67,34 @@ class Project:
         self.final_artifact_check = None
         self.final_validation_unavailable = False
         self.final_repair_required = False
+        self.candidate_submitted = False
         # [P0] 文件"搬移推断"的递归深度（只允许一层，避免 5^k 重试爆炸）
         self._move_depth = 0
 
+    def persist_candidate(self, patch: str, ref: str):
+        """Keep the latest submission recoverable before any fallible checks run."""
+        directory = getattr(self, 'candidate_checkpoint_dir', None)
+        if not directory:
+            return
+        os.makedirs(directory, exist_ok=True)
+        blob = (patch if patch.endswith('\n') else patch + '\n').encode('utf-8', 'surrogateescape')
+        metadata = dict(kind='unvalidated_candidate', validation_required=True,
+                        base_ref=getattr(self, 'full_patch_base', None) or ref,
+                        patch='latest-candidate.patch', sha256=hashlib.sha256(blob).hexdigest())
+        for name, content in [('latest-candidate.patch', blob),
+                              ('latest-candidate.json', (json.dumps(metadata, indent=2) + '\n').encode())]:
+            path = os.path.join(directory, name)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=directory, delete=False) as handle:
+                    temporary = handle.name
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+            finally:
+                if temporary and os.path.exists(temporary):
+                    os.unlink(temporary)
 
     def persist_validated_patch(self, patch: str, ref: str):
         """Persist a successfully validated candidate immediately.
@@ -636,6 +663,7 @@ class Project:
         if facts["errors"]:
             self.repo.git.reset("--hard")
             return "STRUCTURAL_VALIDATION_FAILED: " + json.dumps(facts, ensure_ascii=False) + "\n"
+        self.validation_candidate_tree = facts.get('candidate_tree')
         if facts["files"]:
             ret += "SOURCE_FACTS (syntax only, not a semantic verdict): " + json.dumps(facts, ensure_ascii=False) + "\n"
 
@@ -693,24 +721,21 @@ class Project:
 
         if build_process.returncode != 0:
             logger.info(f"Compilation                       FAILED")
-            error_lines = "\n".join(
-                [
-                    line
-                    for line in compile_result.splitlines()
-                    if "error:" in line.lower()
-                ]
-            )
-            # [asan-runner] 提取不到 error: 时回退到输出尾部，避免空错误信息
-            if not error_lines.strip():
-                error_lines = "\n".join(compile_result.splitlines()[-15:])
-            if not error_lines.strip():
-                error_lines = "[build.sh stderr]\n" + "\n".join(
-                    (compile_stderr or "").splitlines()[-15:]
-                )
+            error_lines = compiler_diagnostics(compile_result)
+            self.validation_infrastructure_failure = infrastructure_failure(compile_result)
+            if self.validation_infrastructure_failure:
+                return 'VALIDATION_INFRASTRUCTURE_FAILURE: ' + json.dumps(
+                    self.validation_infrastructure_failure, ensure_ascii=False)
+            try:
+                context = candidate_diagnostic_context(
+                    self.dir, getattr(self, 'validation_candidate_tree', None), error_lines)
+            except Exception as exc:
+                context = {'unavailable': type(exc).__name__ + ': ' + str(exc)}
             logger.debug(error_lines)
             ret += "The source code could not be COMPILED successfully after applying the patch. "
             ret += "Next I'll give you the error message during compiling, and you should modify the error patch. "
             ret += f"Here is the error message:\n{error_lines}\n"
+            ret += 'CANDIDATE_DIAGNOSTIC_CONTEXT: ' + json.dumps(context, ensure_ascii=False) + '\n'
             ret += "Please revise the patch with above error message. "
             ret += "Or use tools `locate_symbol` and `viewcode` to re-check patch-related code snippet. "
             ret += "Please DO NOT send the same patch to me, repeated patches will harm the lives of others.\n"
@@ -730,6 +755,8 @@ class Project:
             str: A message indicating the result of the testcase process.
         """
         ret = ""
+        self.testcase_succeeded = False
+        self.poc_succeeded = False
         logger.debug("Run testcase after compile")
 
         if not os.path.exists(os.path.join(self.dir, "test.sh")):
@@ -761,13 +788,26 @@ class Project:
         if testcase_process.returncode != 0:
             logger.info(f"Testsuite                         FAILED")
             logger.debug(f"{testcase_result}")
+            self.validation_infrastructure_failure = infrastructure_failure(testcase_result)
+            if self.validation_infrastructure_failure:
+                return 'VALIDATION_INFRASTRUCTURE_FAILURE: ' + json.dumps(
+                    self.validation_infrastructure_failure, ensure_ascii=False)
             ret = "The patched program could not pass the testcase. "
+            try:
+                context = candidate_failure_context(
+                    self.dir, getattr(self, 'validation_candidate_tree', None), testcase_result)
+            except Exception as exc:  # Evidence failure must not hide the real test failure.
+                context = {'unavailable': type(exc).__name__ + ': ' + str(exc)}
+            ret += ('\nCANDIDATE_FAILURE_CONTEXT: ' + json.dumps(context, ensure_ascii=False)
+                    + '\nTraceback lines refer to this candidate, not the original base. '
+                    'Start from the failing assertion and its concrete caller. Check setup and '
+                    'state retained by earlier subcases before proposing a cause; source excerpts '
+                    'are evidence, not a diagnosis. Preserve the required behavior and assertions.\n')
             ret += "Next I'll give you the error message during running the testcase, and you should modify the previous error patch according to this section. "
             ret += f"Here is the error message:\n{testcase_result}\n"
             ret += "Please revise the patch with above error message. "
             ret += "Or use tools `locate_symbol` and `viewcode` to re-check patch-related code snippet. "
             ret += "Please DO NOT send the same patch to me, repeated patches will harm the lives of others.\n"
-            self.compile_succeeded = False
         else:
             logger.info(f"Testsuite                         PASS")
             ret += "The patched source code could pass TESTCASE! I really thank you for your great efforts.\n"
@@ -782,6 +822,7 @@ class Project:
             str: A message indicating the result of the PoC process.
         """
         ret = ""
+        self.poc_succeeded = False
         logger.debug("Run PoC after compile and run testcase")
 
         if not os.path.exists(os.path.join(self.dir, "poc.sh")):
@@ -822,8 +863,6 @@ class Project:
             ret += "Please revise the patch with above error message. "
             ret += "Or use tools `locate_symbol` and `viewcode` to re-check patch-related code snippet. "
             ret += "Please DO NOT send the same patch to me, repeated patches will harm the lives of others.\n"
-            self.compile_succeeded = False
-            self.testcase_succeeded = False
         else:
             logger.info(f"PoC test                          PASS")
             ret += "Existing PoC could NOT TRIGGER the bug, which means your patch successfully fix the bug! I really thank you for your great efforts.\n"
@@ -832,6 +871,37 @@ class Project:
             self.poc_succeeded = True
         return ret
 
+    def _submit_candidate(self, ref: str, patch: str) -> str:
+        if not self.all_hunks_applied_succeeded:
+            return 'CANDIDATE_SUBMISSION_INVALID: intermediate submission requires full-patch repair mode.'
+        self.compile_succeeded = False
+        self.testcase_succeeded = False
+        self.poc_succeeded = False
+        self.final_validation_unavailable = False
+        self.final_repair_required = False
+        self.semantic_candidate_ready = False
+        if self.final_artifact_check is None:
+            return 'CANDIDATE_SUBMISSION_INVALID: no final artifact checker is configured.'
+        self.latest_candidate_patch = patch
+        self.persist_candidate(patch, ref)
+        try:
+            failure = self.final_artifact_check(patch)
+        except FinalValidationUnavailable as exc:
+            self.candidate_submitted = True
+            self.final_validation_unavailable = True
+            self.final_repair_required = bool(exc.repair_feedback)
+            return ('CANDIDATE_SEMANTIC_CHECK_UNAVAILABLE: ' + str(exc)
+                    + '\nNo build or tests were run. Review availability is not a code defect.\n'
+                    + exc.repair_feedback)
+        self.candidate_submitted = True
+        if failure:
+            self.final_repair_required = True
+            return ('CANDIDATE_RECORDED_WITH_FINDINGS: no build or tests were run.\n'
+                    + failure)
+        self.semantic_candidate_ready = True
+        return ('CANDIDATE_SEMANTIC_CHECK_PASS: the complete candidate is recorded. '
+                'Stop this repair session now without further edits or tool calls. '
+                'The orchestrator will run final build/test/PoC validation.')
 
     def _validate(self, ref: str, patch: str, evidence: str = '') -> str:
         """
@@ -850,12 +920,17 @@ class Project:
             self.compile_succeeded = False
             self.testcase_succeeded = False
             self.poc_succeeded = False
+            self.validation_candidate_tree = None
+            self.validation_infrastructure_failure = None
             self.final_validation_unavailable = False
             self.final_repair_required = False
+            self.persist_candidate(patch, ref)
             ret = self._compile_patch(self.full_patch_base or ref, patch)
             if self.compile_succeeded and not self.testcase_succeeded:
                 ret += self._run_testcase()
             self.final_repair_required = not (self.compile_succeeded and self.testcase_succeeded)
+            if self.validation_infrastructure_failure:
+                return ret
             # Collect build/test evidence even when semantic review is unavailable.
             # Acceptance and validated checkpoints still require both kinds of evidence.
             if self.final_artifact_check is not None:
@@ -1077,6 +1152,38 @@ def creat_viewcode_tool(project: Project):
     return viewcode
 
 
+def create_submit_candidate_tool(project: Project):
+    @tool
+    def submit_candidate(ref: str, patch: str) -> str:
+        """Submit a local unified diff against the supplied immutable candidate ref.
+        The program preserves other changes and constructs the complete patch for review.
+        Stale refs or context conflicts are rejected without replacing the candidate.
+        A recorded candidate ends this session; no build/tests run here.
+        """
+        expected = getattr(project, 'repair_candidate_ref', None)
+        if expected is not None:
+            if ref != expected or expected == 'unavailable':
+                return 'CANDIDATE_SUBMISSION_INVALID: use the exact current candidate ref: ' + expected
+            base = project.full_patch_base
+            try:
+                current = artifact_tree(project.dir, base, project.latest_candidate_patch)
+                if current != expected:
+                    return 'CANDIDATE_SUBMISSION_INVALID: candidate changed; start a fresh repair session.'
+                tree = artifact_tree(project.dir, expected, patch, strict=True)
+                patch = candidate_diff(project.dir, base, tree)
+                if not patch.strip():
+                    return 'CANDIDATE_SUBMISSION_INVALID: edit would remove the entire backport.'
+            except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                detail = getattr(exc, 'stderr', None) or str(exc)
+                return 'CANDIDATE_SUBMISSION_INVALID: local edit was not applied. ' + str(detail)[:2000]
+            ref = base
+        if getattr(project, 'query_progress', None):
+            project.query_progress.validated()
+        ret = project._submit_candidate(ref, patch)
+        project.latest_validation_result = ret
+        return ret
+
+    return submit_candidate
 
 
 def create_validate_tool(project: Project):
