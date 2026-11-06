@@ -14,8 +14,11 @@ from langchain_core.tools import tool
 
 import tools.utils as utils
 from tools.logger import logger
-from tools.source_structure import SymbolIndex, normalize_symbol
-from tools.source_checks import inspect_worktree_patch, candidate_api_inventory
+from tools.source_structure import SymbolIndex, normalize_symbol, normalize_query_symbol, resolve_source_ref
+from tools.source_checks import (inspect_worktree_patch, candidate_api_inventory,
+                                 candidate_failure_context, candidate_diagnostic_context,
+                                 compiler_diagnostics, infrastructure_failure,
+                                 artifact_tree, candidate_diff)
 
 
 class FinalValidationUnavailable(RuntimeError):
@@ -51,6 +54,7 @@ class Project:
         self.validated_complete_patch = None
         self.source_index = SymbolIndex(self.dir)
         self.query_progress = None
+        self.api_context = None
         self.query_stale_limit = getattr(data, "query_stale_limit", 4)
         self.now_hunk = ""
         self.now_hunk_num = 0
@@ -63,6 +67,7 @@ class Project:
         self.final_repair_required = False
         # [P0] 文件"搬移推断"的递归深度（只允许一层，避免 5^k 重试爆炸）
         self._move_depth = 0
+
 
     def persist_validated_patch(self, patch: str, ref: str):
         """Persist a successfully validated candidate immediately.
@@ -145,23 +150,43 @@ class Project:
             str: The content of the file between the specified startline and endline.
                  If the file doesn't exist in the commit, a message indicating that is returned.
         """
-        sha = self.repo.commit(ref).hexsha
+        blocked = _begin_read(self)
+        if blocked:
+            return blocked
+        sha = resolve_source_ref(self.repo.working_tree_dir or self.repo.git_dir, ref)
         query = dict(ref=sha, path=path, startline=startline, endline=endline)
         try:
-            file = self.repo.tree(sha) / path
+            tree = self.repo.tree(sha)
+            # GitPython does not set the root path when given a bare tree SHA.
+            tree.path = ''
+            file = tree / path
         except KeyError:
             return _read_result(self, 'viewcode', query, [(sha, path, 'missing')],
-                                "This file doesn't exist in this commit.")
+                                "MISSING_PATH: this file does not exist at the requested ref. "
+                                "Use locate_symbol without this path to find the owning file; "
+                                "a nested class or inherited method need not live in a same-named file.")
         lines = file.data_stream.read().decode('utf-8', errors='replace').splitlines()
         startline, endline = max(1, min(startline, endline)), max(startline, endline)
         if startline > len(lines) or endline < 1:
             return _read_result(self, 'viewcode', query, [(sha, path, 'line_count', len(lines))],
                                 'Requested range is outside the file (%d lines).' % len(lines))
         endline = min(endline, len(lines))
-        output = '%s:%s lines %d-%d\n' % (sha, path, startline, endline)
-        output += '\n'.join('%d: %s' % (i + 1, lines[i]) for i in range(startline - 1, endline))
-        return _read_result(self, 'viewcode', query,
-                            [(sha, path, i) for i in range(startline, endline + 1)], output)
+        progress = getattr(self, 'query_progress', None)
+        if progress is not None:
+            output, facts = progress.source_excerpt(sha, path, startline, lines[startline - 1:endline],
+                max_chars=None if getattr(self, 'unlimited_backend', False) else 12000)
+        else:
+            output = '%s:%s lines %d-%d\n' % (sha, path, startline, endline)
+            output += '\n'.join('%d: %s' % (i + 1, lines[i]) for i in range(startline - 1, endline))
+            facts = [(sha, path, i) for i in range(startline, endline + 1)]
+        result = _read_result(self, 'viewcode', query, facts, output)
+        if progress is not None and result == output:
+            progress.source_seen.update(facts)
+        context = getattr(self, 'api_context', None)
+        if context is not None and result == output:
+            for _, _, line in facts:
+                context.record_source_read(sha, path, line, line)
+        return result
 
     def _locate_symbol(self, ref: str, symbol: str) -> List[Tuple[str, int]] | None:
         """
@@ -524,10 +549,15 @@ class Project:
             try:
                 facts = inspect_worktree_patch(self.dir, self.repo.head.commit.hexsha, revised_patch)
                 apis = (candidate_api_inventory(self.source_index, self.repo.head.commit.hexsha,
-                                               revised_patch, facts['signature_changes'])
+                                               revised_patch, facts['signature_changes'],
+                                               tree=facts['candidate_tree'])
                         if facts['signature_changes'] and not facts['errors'] else [])
-            except Exception:
+            except Exception as exc:
                 self.repo.git.apply("--reverse", f.name)
+                if isinstance(exc, (ValueError, subprocess.SubprocessError, GitCommandError)):
+                    detail = getattr(exc, 'stderr', '') or str(exc)
+                    return ('CANDIDATE_INSPECTION_FAILED: the patch was rolled back; no group candidate '
+                            'was accepted. Correct the application/check error and resubmit.\n' + str(detail))
                 raise
             if facts["errors"]:
                 self.repo.git.apply("--reverse", f.name)
@@ -802,6 +832,7 @@ class Project:
             self.poc_succeeded = True
         return ret
 
+
     def _validate(self, ref: str, patch: str, evidence: str = '') -> str:
         """
         Validates a patch by using the `_compile_patch`, `_run_testcase`, and `_run_poc` methods.
@@ -879,40 +910,157 @@ class Project:
         )
 
 
+def _begin_read(project):
+    """Charge before Git searches/parsing, including invalid and repeated requests."""
+    remaining = getattr(project, 'final_repair_reads_remaining', None)
+    if remaining is not None:
+        if remaining <= 0:
+            return ('READ_BUDGET_EXHAUSTED: stop querying source and submit the local repair '
+                    'against the candidate ref with submit_candidate. Use the facts already collected; '
+                    'final validation will reject any remaining concrete errors.')
+        project.final_repair_reads_remaining = remaining - 1
+    return None
+
+
 def _read_result(project, tool, query, facts, output):
     progress = getattr(project, 'query_progress', None)
+    limit = getattr(project, 'final_repair_read_limit', None)
+    if limit is not None and len(output) > limit:
+        original_length = len(output)
+        output = output[:limit] + (
+            '\nREAD OUTPUT TRUNCATED: %d of %d characters shown. '
+            'Use a qualified symbol, a path filter, or a smaller viewcode range; '
+            'do not repeat this broad read.' % (limit, original_length))
+        # Hidden records must not become "seen" and suppress later narrow reads.
+        facts = [('truncated_output', hashlib.sha256(output.encode('utf-8')).hexdigest())]
     return progress.observe(tool, query, facts, output) if progress is not None else output
+
+
+def _symbol_query_error(symbol):
+    try:
+        normalize_query_symbol(symbol)
+    except ValueError as exc:
+        return json.dumps(dict(query_status='invalid_query', searched=False,
+                               error=str(exc)), ensure_ascii=False)
+    return None
 
 
 def create_find_references_tool(project: Project):
     @tool
-    def find_references(ref: str, symbol: str) -> str:
-        """List parsed definitions and ALL same-name call candidates at a fixed Git ref.
-        Includes receiver, arguments, scope and location. Candidates are not type-bound;
-        inspect the actual receiver/overload before deciding which calls need changing.
+    def find_references(ref: str, symbol: str, path: str = '') -> str:
+        """Find calls and constant/variable/field identifier occurrences at a fixed ref.
+        Call candidates include receiver, arguments and scope; identifier occurrences
+        include source lines and enclosing ranges, also at declarations. Neither proves
+        owner/type/dataflow binding. Unparsed text is separate and may include non-code.
+        Use a known path to restrict the search. Read query_status and diagnostics before
+        interpreting an empty result. Use locate_symbol for declaration signatures.
+        symbol must be a code symbol, never a filename such as Example.java; use path for files.
         """
-        result = project.source_index.inspect(ref, symbol)
-        return _read_result(project, 'find_references', dict(ref=result['ref'], symbol=symbol),
-                            [(result['ref'], result)], json.dumps(result, ensure_ascii=False))
+        blocked = _begin_read(project)
+        if blocked:
+            return blocked
+        invalid = _symbol_query_error(symbol)
+        if invalid:
+            return invalid
+        inspected = project.source_index.inspect(ref, symbol, path=path, include_occurrences=True)
+        result = {k: v for k, v in inspected.items() if k != 'definitions'}
+        encoded = json.dumps(result, ensure_ascii=False)
+        delivered = _read_result(project, 'find_references',
+                                 dict(ref=result['ref'], symbol=symbol, path=path),
+                                 [(result['ref'], result)], encoded)
+        progress = getattr(project, 'query_progress', None)
+        if progress is not None and delivered == encoded:
+            progress.source_seen.update((result['ref'], row['path'], row['line'])
+                                        for row in result['identifier_occurrences'] + result['text_occurrences'])
+        return delivered
 
     return find_references
 
 
+def create_query_api_context_tool(project: Project):
+    @tool
+    def query_api_context(symbol: str, record_type: str = 'all', path: str = '',
+                          scope: str = '', argument_count: int = -1,
+                          offset: int = 0, limit: int = 0) -> str:
+        """Query bounded definitions/references from the current group's API inventory.
+        No arbitrary file or artifact access is available. Complete every required symbol
+        with record_type=all before editing; paginate or narrow relevant results.
+        limit=0 uses the configured per-group page limit.
+        """
+        blocked = _begin_read(project)
+        if blocked:
+            return blocked
+        context = getattr(project, 'api_context', None)
+        effective_limit = context.page_limit if limit == 0 and context is not None else limit
+        query = dict(symbol=symbol, record_type=record_type, path=path, scope=scope,
+                     argument_count=argument_count, offset=offset, limit=effective_limit)
+        if context is None:
+            result = dict(error='No active group API context')
+        else:
+            try:
+                result = context.query(
+                    symbol=symbol, record_type=record_type, path=path, scope=scope,
+                    argument_count=None if argument_count == -1 else argument_count,
+                    offset=offset, limit=effective_limit, record_read=False)
+            except ValueError as exc:
+                result = dict(error=str(exc), allowed_symbols=sorted(context.apis))
+        facts = result.get('definitions', []) + result.get('references', []) + result.get('oversized', [])
+        output = json.dumps(result, ensure_ascii=False)
+        delivered = _read_result(project, 'query_api_context', query, facts, output)
+        if context is not None and 'error' not in result and delivered == output:
+            context.record_query_read(result)
+        return delivered
+
+    return query_api_context
+
+
 def creat_locate_symbol_tool(project: Project):
     @tool
-    def locate_symbol(ref: str, symbol: str) -> str:
+    def locate_symbol(ref: str, symbol: str, path: str = '') -> str:
         """
-        Locate a symbol in a specific ref of the target repository.
+        Locate definitions, optionally in one repository-relative path.
+        A unique small definition includes its source. Multiple definitions stay explicit.
+        Omit path if the owning file is unknown; nested/inherited members may be elsewhere.
+        Local variables may lack indexed declarations: use find_references for occurrences.
+        symbol must be a code symbol, never a filename such as Example.java; use path for files.
         """
-        result = project.source_index.inspect(ref, symbol)
-        output = {k: result[k] for k in ('ref', 'symbol', 'definitions', 'diagnostics')}
+        blocked = _begin_read(project)
+        if blocked:
+            return blocked
+        invalid = _symbol_query_error(symbol)
+        if invalid:
+            return invalid
+        result = project.source_index.inspect(ref, symbol, path=path) if path else project.source_index.inspect(ref, symbol)
+        output = {k: result[k] for k in ('ref', 'symbol', 'definitions', 'diagnostics',
+                  'searched_path', 'scope_status', 'query_status', 'search_domain', 'next_action') if k in result}
         if not result['definitions']:
             output['status'] = 'No exact parsed declaration; parse gaps do not prove absence'
+            if 'next_action' not in output:
+                output['next_action'] = ('Search the unqualified name without a guessed path for moved, nested or inherited declarations; '
+                                         'use find_references for local variables and field/constant occurrences.')
             name = normalize_symbol(symbol).rsplit('.', 1)[-1]
             if name != normalize_symbol(symbol):
-                output['other_owner_candidates'] = project.source_index.inspect(ref, name)['definitions']
-        return _read_result(project, 'locate_symbol', dict(ref=result['ref'], symbol=symbol),
-                            [(result['ref'], output)], json.dumps(output, ensure_ascii=False))
+                output['other_owner_candidates'] = (project.source_index.inspect(ref, name, path=path)
+                    if path else project.source_index.inspect(ref, name))['definitions']
+        facts = []
+        progress = getattr(project, 'query_progress', None)
+        if len(result['definitions']) == 1 and hasattr(project, 'repo'):
+            definition = result['definitions'][0]
+            start, end = definition['start'], definition['end']
+            if end - start < 80 and len(json.dumps(output, ensure_ascii=False)) < 8000:
+                source = project.repo.git.show('%s:%s' % (result['ref'], definition['path'])).splitlines()
+                if progress is not None:
+                    quote, facts = progress.source_excerpt(result['ref'], definition['path'], start,
+                    source[start-1:end], max_chars=None if getattr(project, 'unlimited_backend', False) else 8000)
+                else:
+                    quote = '\n'.join('%d: %s' % (i, source[i-1]) for i in range(start, end+1))
+                output['source'] = quote
+        encoded = json.dumps(output, ensure_ascii=False)
+        delivered = _read_result(project, 'locate_symbol', dict(ref=result['ref'], symbol=symbol, path=path),
+                                 [(result['ref'], output)], encoded)
+        if progress is not None and delivered == encoded:
+            progress.source_seen.update(facts)
+        return delivered
 
     return locate_symbol
 
@@ -921,11 +1069,14 @@ def creat_viewcode_tool(project: Project):
     @tool
     def viewcode(ref: str, path: str, startline: int, endline: int) -> str:
         """
-        View a file from a specific ref of the target repository. Lines between startline and endline are shown.
+        Read lines from a Git commit or immutable candidate tree ref.
+        Use the candidate ref for failure lines; use the base ref for patch context.
         """
         return project._viewcode(ref, path, startline, endline)
 
     return viewcode
+
+
 
 
 def create_validate_tool(project: Project):
@@ -935,9 +1086,22 @@ def create_validate_tool(project: Project):
         Validate a patch on a target ref. For "need not ported", evidence must explain
         each hunk using target files/symbols; the decision remains pending final review.
         """
+        if not getattr(project, 'full_validation_allowed', True):
+            return ('FULL_VALIDATION_DEFERRED: finish all known repair stages first. '
+                    'Use submit_candidate for this intermediate complete candidate; '
+                    'build and tests will run after the remaining stages.')
+        context = getattr(project, 'api_context', None)
+        if context is not None:
+            reads = context.read_report()
+            if reads['missing']:
+                return ('CONTEXT_READS_INCOMPLETE: query every missing symbol with '
+                        'query_api_context before validate. pending.next_record is the unfiltered '
+                        'offset for that record_type; paginate and read oversized source ranges: '
+                        + json.dumps(reads['pending'], ensure_ascii=False))
         if getattr(project, 'query_progress', None):
             project.query_progress.validated()
         ret = project._validate(ref, patch, evidence)
+        project.latest_validation_result = ret
         if project.poc_succeeded:
             project.persist_validated_patch(patch, ref)
         return ret

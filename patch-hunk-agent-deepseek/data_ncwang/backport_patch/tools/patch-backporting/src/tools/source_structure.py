@@ -96,6 +96,15 @@ def declarator_name(node):
     return None
 
 
+def call_name_node(node):
+    name = child(node, "name", "function", "type")
+    if name is None and node.type == "call_expression":
+        name = node.named_children[0] if node.named_children else None
+    if name is None and node.type == "method_reference":
+        name = next((n for n in reversed(node.named_children) if n.type in IDENTIFIERS), None)
+    return name
+
+
 class Source:
     def __init__(self, path, data):
         self.path, self.data = path, data
@@ -234,11 +243,7 @@ class Source:
         for node in walk(self.tree.root_node):
             if node.type not in CALLS | {"method_reference"}:
                 continue
-            name = child(node, "name", "function", "type")
-            if name is None and node.type == "call_expression":
-                name = node.named_children[0] if node.named_children else None
-            if name is None and node.type == "method_reference":
-                name = next((n for n in reversed(node.named_children) if n.type in IDENTIFIERS), None)
+            name = call_name_node(node)
             callee = self.text(name)
             if wanted is not None and re.split(r"[.:>]", callee)[-1] != wanted:
                 continue
@@ -332,6 +337,7 @@ class Source:
                             and n.parent.type not in {"scoped_identifier", "scoped_type_identifier",
                                                       "field_access", "import_declaration"}
                             and (n.type == "type_identifier" or
+                                 (n.type == "identifier" and n.parent.type in {"annotation", "marker_annotation"}) or
                                  (n.parent.type == "method_invocation" and child(n.parent, "object") == n))):
                         result["import_uses"].append({"qualified_name": entries[0]["qualified_name"],
                                                      "line": n.start_point.row + 1, "identifier": name})
@@ -377,6 +383,15 @@ def git(repo, *args):
 
 def resolve_ref(repo, ref):
     return git(repo, "rev-parse", "--verify", ref + "^{commit}").decode().strip()
+
+
+def resolve_source_ref(repo, ref):
+    """Read commits or immutable candidate trees; never fall back to the checkout."""
+    try:
+        return resolve_ref(repo, ref)
+    except subprocess.CalledProcessError:
+        return git(repo, "rev-parse", "--verify", "--end-of-options",
+                   ref + "^{tree}").decode().strip()
 
 
 @lru_cache(maxsize=8)
@@ -609,8 +624,118 @@ def structure_relations(records):
     return relations
 
 
+def changed_scope_context(repo, parent, commit, hunks):
+    """Join hunks by their actual post-change function, retaining complete source.
+
+    This is source evidence, not a generated contract or a test-equivalence verdict.
+    A setup change and a later assertion change in the same function share one scope.
+    """
+    scopes, by_hunk, diagnostics = {}, {}, {}
+    for hunk in hunks:
+        ids = []
+        try:
+            evidence = hunk_evidence(repo, parent, commit, hunk)
+            after = evidence['after']
+            if after.get('status') not in {'ok', 'missing'}:
+                diagnostics[hunk['idx']] = after.get('reason', after.get('status'))
+            for scope in after.get('scopes', []):
+                if scope['kind'] not in {'function', 'lambda'}:
+                    continue
+                path, start, end = after['path'], scope['start'], scope['end']
+                identity = [commit, path, start, end]
+                key = 'U' + hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:16]
+                if key not in scopes:
+                    source = snapshot(repo, commit, path)
+                    facts = source.evidence(range(start, end + 1), start, end - start + 1)
+                    scopes[key] = dict(ref=commit, path=path, name=scope['qualified_name'],
+                        signature=scope['signature'],
+                        start_line=start, end_line=end,
+                        quote='\n'.join(source.data.decode('utf-8', 'replace').splitlines()[start-1:end]),
+                        complete=True, parse_status=source.status,
+                        related_hunks=[], calls=facts['calls'], writes=facts['writes'],
+                        statements=facts['statements'])
+                scopes[key]['related_hunks'].append(hunk['idx'])
+                ids.append(key)
+        except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            diagnostics[hunk['idx']] = str(exc)
+        by_hunk[hunk['idx']] = ids
+    return dict(scopes=scopes, by_hunk=by_hunk, diagnostics=diagnostics)
+
+
 def normalize_symbol(symbol):
     return re.sub(r"\([^)]*\)\s*$", "", symbol).replace("::", ".").replace("#", ".").strip()
+
+
+def normalize_query_symbol(symbol):
+    """Reject file queries before qualified-name normalization can hide the mistake."""
+    raw = symbol.strip()
+    extensions = set(EXTENSIONS) | set(settings().get('extensions', {}))
+    file_suffix = r'(?:' + '|'.join(re.escape(ext) for ext in extensions) + r')(?::\d+(?::\d+)?)?$'
+    if '/' in raw or '\\' in raw or re.search(file_suffix, raw, re.IGNORECASE):
+        raise ValueError('symbol expects a code symbol, not a filename or path. '
+                         'Use the actual class/member name, e.g. ExampleTest or ExampleTest.testCase; '
+                         'put a known repository-relative file path in path, or read it with viewcode. '
+                         'A filename does not prove that a same-named class exists.')
+    normalized = normalize_symbol(raw)
+    if not normalized or any(char.isspace() or ord(char) < 32 for char in normalized):
+        raise ValueError('Expected one nonempty symbol name, optionally qualified by its owner.')
+    return normalized
+
+
+def name_occurrences(path, data, name, source=None, calls=()):
+    """Exact identifier locations, with unparsed text kept explicitly separate.
+
+    These are lexical matches, not a use/definition or receiver binding analysis.
+    In particular, two local variables with the same name remain separate candidates.
+    """
+    identifiers, text_matches, excluded = [], [], 0
+    call_sites = {(c['line'], c['expression']) for c in calls}
+    pattern = re.compile(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])")
+    offset = 0
+    for number, raw_line in enumerate(data.splitlines(keepends=True), 1):
+        line = raw_line.decode('utf-8', 'replace').rstrip('\r\n')
+        for match in pattern.finditer(line):
+            start = offset + len(line[:match.start()].encode('utf-8'))
+            end = offset + len(line[:match.end()].encode('utf-8'))
+            node = (source.tree.root_node.descendant_for_byte_range(start, end)
+                    if source is not None and source.tree is not None else None)
+            parsed = (node is not None and node.type in IDENTIFIERS
+                      and node.start_byte == start and node.end_byte == end)
+            ancestor = node
+            non_code = False
+            # Interpolated expressions may contain real identifiers inside strings.
+            while ancestor is not None and not parsed:
+                if 'comment' in ancestor.type or 'string' in ancestor.type or ancestor.type == 'char_literal':
+                    non_code = True
+                    break
+                ancestor = ancestor.parent
+            if non_code:
+                excluded += 1
+                continue
+            if parsed and call_sites:
+                call = node.parent
+                while call is not None and call.type not in CALLS | {'method_reference'}:
+                    call = call.parent
+                if call is not None and (call.start_point.row + 1, source.text(call)) in call_sites:
+                    callee = call_name_node(call)
+                    # Only the callee token is redundant. Same-name receivers/arguments
+                    # still need their own lexical locations (e.g. send(send)).
+                    if callee is not None and callee.start_byte <= start and callee.end_byte == end:
+                        continue
+            row = dict(path=path, line=number, column=match.start() + 1, text=line)
+            if parsed:
+                scopes = [d for d in source.declarations if d['kind'] in {'function', 'type', 'lambda'}
+                          and d['_node'].start_byte <= start < d['_node'].end_byte]
+                if scopes:
+                    owner = min(scopes, key=lambda d: d['_node'].end_byte - d['_node'].start_byte)
+                    row.update(scope=owner['qualified_name'], scope_start=owner['start'], scope_end=owner['end'])
+                row.update(node_type=node.type, resolution='lexical_identifier')
+                identifiers.append(row)
+            else:
+                row['resolution'] = 'unparsed_text; may include non-code, not a proven reference'
+                text_matches.append(row)
+        offset += len(raw_line)
+    return identifiers, text_matches, excluded
 
 
 class SymbolIndex:
@@ -638,37 +763,75 @@ class SymbolIndex:
         return sorted({(d["path"], d["name_line"])
                        for d in self.inspect(ref, symbol)["definitions"]}) or None
 
-    def inspect(self, ref, symbol):
+    def inspect(self, ref, symbol, path='', include_occurrences=False):
         """Return all searched declarations/call candidates and explicit parse gaps."""
-        sha = resolve_ref(self.repo, ref)
-        symbol = normalize_symbol(symbol)
-        key = (sha, symbol)
+        symbol = normalize_query_symbol(symbol)
+        sha = resolve_source_ref(self.repo, ref)
+        key = (sha, symbol, path, include_occurrences)
         if key in self.inspections:
             return self.inspections[key]
         name = symbol.replace("::", ".").rsplit(".", 1)[-1]
+        if not name or '\x00' in name or '\n' in name or '\r' in name:
+            raise ValueError('Expected a nonempty symbol name')
+        if path and (path.startswith('/') or '..' in path.split('/') or '\x00' in path):
+            raise ValueError('Expected a repository-relative source path')
+        pathspec = [':(literal)' + path] if path else []
+        scope_status = 'repository'
+        if path:
+            entries = git(self.repo, 'ls-tree', '-z', sha, '--', *pathspec).split(b'\0')
+            entry = next((e for e in entries if e and os.fsdecode(e.split(b'\t', 1)[1]) == path), None)
+            kind = entry.split(None, 2)[1] if entry else None
+            scope_status = {b'blob': 'file', b'tree': 'directory'}.get(kind, 'missing_path' if entry is None else 'non_source_path')
+        output = dict(ref=sha, symbol=symbol, searched_path=path, scope_status=scope_status,
+                      definitions=[], references=[], diagnostics=[],
+                      reference_resolution='name candidates; receiver/overload binding is not proven')
+        if include_occurrences:
+            output.update(identifier_occurrences=[], text_occurrences=[], non_code_match_count=0,
+                          occurrence_resolution='exact final-name tokens, including declarations; callee tokens already in references omitted; no variable or owner binding')
+        if scope_status in {'missing_path', 'non_source_path'}:
+            output.update(query_status=scope_status,
+                          next_action='Use locate_symbol without this path to find the declaration; do not read the same missing path.')
+            self.inspections[key] = output
+            return output
         result = subprocess.run(["git", "-C", self.repo, "grep", "-Ilz", "-F",
-                                 "-e", name, sha, "--"], capture_output=True)
+                                 "-e", name, sha, "--"] + pathspec,
+                                capture_output=True, timeout=60)
         if result.returncode not in (0, 1):
             raise RuntimeError("Git reference candidate search failed")
-        definitions, references, diagnostics = [], [], []
-        for item in result.stdout.split(b"\0"):
-            if not item:
+        paths = [os.fsdecode(item).split(':', 1)[1] for item in result.stdout.split(b'\0') if item]
+        # Even a scoped zero-hit query must report an unsupported/partial parser.
+        if scope_status == 'file' and path not in paths:
+            paths.append(path)
+        for file_path in paths:
+            if not language_for(file_path) and file_path != path:
                 continue
-            path = os.fsdecode(item).split(":", 1)[1]
-            if not language_for(path):
+            try:
+                source = snapshot(self.repo, sha, file_path)
+            except RuntimeError as exc:
+                output['diagnostics'].append(dict(path=file_path, status='parser_unavailable', reason=str(exc)))
+                if include_occurrences:
+                    _, matches, _ = name_occurrences(file_path, git(self.repo, 'show', sha + ':' + file_path), name)
+                    output['text_occurrences'].extend(matches)
                 continue
-            source = snapshot(self.repo, sha, path)
             if source.status != "ok":
-                diagnostics.append({"path": path, "status": source.status, "reason": source.reason})
-            definitions.extend(dict(d, path=path) for d in source.definitions(symbol))
-            references.extend(source.references(name))
-        self.inspections[key] = {"ref": sha, "symbol": symbol, "definitions": definitions,
-                "references": references, "diagnostics": diagnostics,
-                "reference_resolution": "name candidates; receiver/overload binding is not proven"}
+                output['diagnostics'].append(dict(path=file_path, status=source.status, reason=source.reason))
+            output['definitions'].extend(dict(d, path=file_path) for d in source.definitions(symbol))
+            calls = source.references(name)
+            output['references'].extend(calls)
+            if include_occurrences:
+                identifiers, matches, excluded = name_occurrences(file_path, source.data, name, source, calls)
+                output['identifier_occurrences'].extend(identifiers)
+                output['text_occurrences'].extend(matches)
+                output['non_code_match_count'] += excluded
+        output['query_status'] = ('parse_gap' if output['diagnostics'] else
+                                 'matches' if any(output.get(k) for k in ('definitions', 'references', 'identifier_occurrences', 'text_occurrences')) else
+                                 'non_code_only' if output.get('non_code_match_count') else 'no_matches')
+        output['search_domain'] = 'supported source extensions; an explicit file is inspected even if unsupported'
+        self.inspections[key] = output
         return self.inspections[key]
 
     def prepare(self, ref):
-        sha = resolve_ref(self.repo, ref)
+        sha = resolve_source_ref(self.repo, ref)
         if sha not in self.complete:
             for path in git(self.repo, "ls-tree", "-rz", "--name-only", sha).split(b"\0"):
                 if path and language_for(os.fsdecode(path)):

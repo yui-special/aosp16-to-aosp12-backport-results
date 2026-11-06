@@ -103,6 +103,7 @@ class GroupComparisonTests(unittest.TestCase):
                  for i, g in enumerate(groups)]
         with patch.object(runtime, "ApiCatalog", return_value=SimpleNamespace(
                 inventory=lambda *args: {"apis": []})), \
+                patch.object(runtime, "target_context", return_value=''), \
                 patch.object(runtime, "logger", self.logger), \
                 patch.object(runtime, "group_patch", return_value=("", groups)), \
                 patch.object(runtime, "split_patch_indexed", return_value=("", hunks)), \
@@ -164,6 +165,7 @@ class GroupComparisonTests(unittest.TestCase):
         ledger = runtime.ChangeLedger()
         commit = (lambda *args: False) if fail_commit else runtime.commit_group
         with patch.object(runtime, "ChangeLedger", return_value=ledger), \
+                patch.object(runtime, "target_context", return_value=''), \
                 patch.object(runtime, "commit_group", side_effect=commit), \
                 patch.object(runtime, "ApiCatalog", return_value=SimpleNamespace(
                 inventory=lambda *args: {"apis": []})), \

@@ -24,9 +24,10 @@ from agent.prompt import (
 )
 from tools.logger import logger
 from tools.group_report import GroupComparison
-from tools.project import Project, FinalValidationUnavailable, create_find_references_tool
+from tools.project import (Project, FinalValidationUnavailable, create_find_references_tool,
+                           create_query_api_context_tool)
 from tools.source_checks import ApiCatalog
-from tools.porting_context import ChangeLedger, QueryProgress, execution_result
+from tools.porting_context import ApiContext, ChangeLedger, QueryProgress, execution_result, target_context
 from agent.coverage import CoverageReviewer
 from tools.utils import (
     dump_merged_hunks,
@@ -100,6 +101,8 @@ def build_hunk_executor(
     project.query_progress = QueryProgress(project.query_stale_limit)
     viewcode, locate_symbol, validate, git_history, git_show = project.get_tools()
     tools = [viewcode, locate_symbol, validate, git_history, git_show, create_find_references_tool(project)]
+    if group_mode and getattr(project, 'api_context', None) is not None:
+        tools.append(create_query_api_context_tool(project))
     agent = create_tool_calling_agent(llm, tools, prompt)
     agent_executor = AgentExecutor(
         agent=agent, tools=tools, verbose=debug_mode, max_iterations=max_iterations
@@ -507,14 +510,15 @@ def do_backport(
         )
         member_hunks = [hunks_by_idx[i] for i in group["hunks"] if i in hunks_by_idx]
         inventory = catalog.inventory(data.target_release, member_hunks, group.get("target_symbols", []))
-        with open(os.path.join(ported_dir, "merged-hunk-%02d.api-inventory.json" % gpos),
-                  "w", encoding="utf-8") as handle:
+        artifact_name = "merged-hunk-%02d.api-inventory.json" % gpos
+        with open(os.path.join(ported_dir, artifact_name), "w", encoding="utf-8") as handle:
             json.dump(inventory, handle, ensure_ascii=False, indent=2)
-        api_note = ("\n[TARGET API FACTS]\nThese are program-collected declarations and call candidates, "
-                    "including target-only callers absent from the upstream patch. Check every candidate "
-                    "when changing a signature; same name/arity does not prove receiver or overload identity. "
-                    "Parse gaps are unknowns. Use find_references for renamed target APIs.\n" +
-                    json.dumps(inventory, ensure_ascii=False))
+        project.api_context = ApiContext(
+            inventory, artifact_name,
+            page_limit=getattr(data, 'context_query_limit', 10),
+            max_chars=getattr(data, 'context_query_chars', 24000),
+            inline_chars=getattr(data, 'context_inline_chars', 6000))
+        api_note = project.api_context.prompt()
         status_path = os.path.join(ported_dir, "merged-hunk-%02d.status.json" % gpos)
         project.round_succeeded = False
         project.context_mismatch_times = 0
@@ -600,6 +604,7 @@ def do_backport(
                         "members": cov["members"],
                         "no_change_evidence": project.no_change_evidence,
                         "requires_final_semantic_review": True,
+                        "context_reads": project.api_context.read_report(),
                         "executions": executions,
                     },
                     fh,
@@ -610,7 +615,9 @@ def do_backport(
         def ledger_note():
             files = set(group.get('files', []))
             files.update(d['path'] for api in inventory['apis'] for d in api['definitions'])
-            return ledger.render(files, [api['symbol'] for api in inventory['apis']], cumulative)
+            symbols = [api['symbol'] for api in inventory['apis']] + group.get('target_symbols', [])
+            return (ledger.render(files, symbols, cumulative) +
+                    target_context(project.source_index, project.repo, data.target_release, group, ledger.limit))
 
         def finalize_group():
             committed = True
@@ -633,6 +640,10 @@ def do_backport(
             project.query_progress = QueryProgress(getattr(project, 'query_stale_limit', 4))
             result, error = None, None
             try:
+                project.api_context.record_inline_read(payload.get('group_desc', ''))
+                project.query_progress.seed_feedback(payload.get('group_desc', ''))
+                for ref, path, line in project.query_progress.seeded_source:
+                    project.api_context.record_source_read(ref, path, line, line)
                 result = executor.invoke(payload, {"callbacks": [log_handler]})
             except Exception as exc:  # A failed session remains visible in its group status.
                 error = exc
@@ -758,6 +769,7 @@ def do_backport(
             )
             logger.info("    详情见 %s" % status_path)
 
+    project.api_context = None
     project.all_hunks_applied_succeeded = all_groups_complete
     logger.info(f"Aplly all hunks in the patch      PASS")
     project.now_hunk = "completed"

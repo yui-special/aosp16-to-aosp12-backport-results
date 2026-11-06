@@ -6,10 +6,13 @@ In patch backports, patches are often not used directly due to changes in CONTEX
 Your OBJECTIVES is to identify changes in context and changes in code logic in the vicinity of the patch. Generate a patch for the old version that matches its code based on the patch in the new version.
 
 You have 6 tools: `viewcode`, `locate_symbol`, `find_references`, `git_history`, `git_show` and `validate`.
-`find_references(ref, symbol)` returns parsed declarations and call candidates, including target-only callers.
+`find_references(ref, symbol)` returns call candidates and identifier occurrences, including target-only callers.
+For find_references and locate_symbol, symbol is a code name such as Example.testCase,
+never a filename such as Example.java. Use path for a known source file. invalid_query
+means no search ran: correct the parameter rather than inferring that code is absent.
 Names and arity do not prove type or overload binding. Preserve explicit parse gaps as unknowns.
 
-- `viewcode` allows you to view a file in the codebase of a ref. When you can't find the relevant code in the continuous viewcode, you should consider whether the hunk doesn't need a backport.
+- `viewcode` reads source at a specified ref/path/range. A missing upstream location requires target mapping, not a decision to skip the obligation.
 0. ref: the commit hash of the ref you want to view the file from.
 1. path: the file path of the file you want to view. The patch is the relative path of the file to the project root directory. For example, if you want to view the file `foo.c` in the project root directory, the file path is `foo.c`. If you want to view the file `foo.c` in the directory `bar`, the file path is `bar/foo.c`.
 2. startline: the start line of the code snippet you want to view.
@@ -85,7 +88,7 @@ Your workflow should be:
 2.2. If there is only a simple modification it means that the code block has not changed and you just need to adapt the context in the corresponding position. (I.e. the patch just needs to adapt the context of the beginning of the space.)
 2.3. If the change code block was initially modified to be  `+`, you can choose to execute the contents of 3. to determine the source of this code.
 3. (Optional) You can only use `git_show` to view the LAST ref in `git_history` to further determine where the code is in older versions and change history. Use this tool ONLY if you think the ref will help to figure out the origin of the code block.
-3.1 If `git_show` indicates that it's new code added to this ref, it means that the patch probably doesn't need to be ported.
+3.1 New upstream code may introduce a required fix or test. Determine its target behavioral obligation; its absence alone is not grounds for skipping it.
 3.2 If `git_show` indicates that this code was moved from somewhere for this ref, it means you need to go to the previous location to do the patch.
 4. Use tool `locate_symbol` to determine where the function or variable that appears in the patch is located in the older version. 
 5. Use tool `viewcode` to view the location of the symbol given by `locate_symbol`, `git_history`, `git_show` or line number given by similar code block. Adjust the `viewcode` parameter until the complete patch-related code fragment from the old version is observed.
@@ -93,6 +96,9 @@ Your workflow should be:
 7. Use `validate` to test the FULL patch on the older version to make sure it can be applied without any conflicts. If you don't think the hunk needs to be ported, you can put `need not ported` in the `patch` parameter of `validate`.
 
 Use supplied facts before requesting more context. Each further query should answer a specific unresolved question.
+KNOWN TARGET FACTS contains existing queries and method source at the stated immutable revision.
+Reuse those locations and negative query results; query again only for a different missing fact or changed revision.
+For a field or logging change, inspect its mapped target method and prior group edits before expanding to class history.
 Once the necessary definitions, callsites and branches are known, submit the complete candidate to validate.
 If queries stop adding facts, identify the exact missing information; do not repeat broad reads or claim a hunk is unnecessary.
 
@@ -237,6 +243,10 @@ target call chain already implements its role. Add prerequisites only where that
 actually lacks required behavior. When earlier groups are already applied, read and reuse
 their definitions. Before validation, check that shared definitions and guards occur only
 where needed and that each member's obligations are accounted for.
+Test obligations remain separate from production implementation. If an upstream test fixture
+or service class is absent, implement the same inputs, exercised behavior and assertions
+against the target's existing implementation. Do not recreate upstream architecture or
+drop a behavior test merely because its upstream test class does not exist.
 """
 )
 
