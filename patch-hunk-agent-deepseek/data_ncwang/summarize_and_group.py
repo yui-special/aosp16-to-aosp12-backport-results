@@ -17,6 +17,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "backport_patch/tools/patch-backporting/src"))
 from tools.utils import split_patch_indexed  # noqa: E402
 from tools.source_structure import hunk_evidence, resolve_ref, syntax_summary  # noqa: E402
+from tools import source_structure
+from tools.frontend import Checkpoint, implementation_id, run_tasks, stage_options, write_json
 
 BASE = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
 SYS = (
@@ -58,6 +60,10 @@ semantic_contract 必须描述修复语义，而不是只复述代码。字段�
 依赖描述应聚焦本 hunk 的行为变化：区分必须同步修改的接口/状态约束和仅供理解的普通调用。
 不要仅因同文件、同函数或共用 helper 就声称必须一起修改；prerequisite_semantics 只写具体必要前提。
 不要猜测目标版本中一定存在哪些符号；search_terms 只用于搜索候选，不能当成等价证明。
+若提供了修改后的完整作用域，以其最终代码为准。同一个测试的 setup、被测调用和断言
+可能分散在多个 hunk；必须一起阅读，不得因为断言不在当前 hunk 就假定旧的期望保持不变。
+测试名称不决定场景，具体布尔值、参数和最终断言决定场景。只描述本 hunk 的贡献，
+但要使它与同一作用域内其他 hunk 的最终行为一致。
 非代码或 noise hunk 的 semantic_contract 可以字段为空，但仍要输出全部字段。
 
 只输出严格 JSON：
@@ -146,6 +152,32 @@ CONTRACT_FIELDS = (
     "callees", "symbol_relations", "prerequisite_semantics", "search_terms", "obligations",
 )
 STRING_CONTRACT_FIELDS = {"goal", "behavior", "failure_behavior", "enclosing_role"}
+
+
+def validate_summary(obj):
+    """Validate new model output before legacy normalization can hide omissions."""
+    if (not isinstance(obj, dict) or obj.get('kind') not in
+            {'declare', 'implement', 'call', 'logic', 'noise'} or obj.get('call_failed')
+            or not isinstance(obj.get('summary'), str) or not obj['summary'].strip()):
+        raise ValueError('summary requires a valid kind and nonempty summary')
+    contract = obj.get('semantic_contract')
+    if not isinstance(contract, dict):
+        raise ValueError('semantic_contract must be an object')
+    for field in CONTRACT_FIELDS:
+        value = contract.get(field)
+        if field in STRING_CONTRACT_FIELDS:
+            valid = isinstance(value, str)
+        else:
+            valid = isinstance(value, list) and all(isinstance(s, str) and s.strip() for s in value)
+        if not valid:
+            raise ValueError('missing or invalid semantic_contract.' + field)
+    if obj['kind'] != 'noise':
+        for field in ('goal', 'behavior', 'enclosing_role', 'obligations'):
+            if not contract[field]:
+                raise ValueError('behavioral hunk requires semantic_contract.' + field)
+        if any(not contract[f].strip() for f in ('goal', 'behavior', 'enclosing_role')):
+            raise ValueError('behavioral contract fields must not be blank')
+    return obj
 
 
 def normalize_contract(obj):
@@ -238,38 +270,61 @@ def main():
     _, hunks = split_patch_indexed(text, True)
     print("hunk 数:", len(hunks))
 
-    rows = []
+    options = stage_options('summary')
+    checkpoint = Checkpoint(out, dict(stage='summary', patch=text,
+        repo=os.path.realpath(args.repo) if args.repo else None,
+        refs=[parent, commit] if args.repo else [], parser=source_structure.settings(),
+        model=model, endpoint=BASE, request_options=options['request_options'],
+        implementation=implementation_id(__file__, source_structure.__file__)), options['resume'])
+    if os.path.exists(out):
+        os.remove(out)
+    rows, tasks, evidence_by_hunk = [], [], {}
+    scope_context = source_structure.changed_scope_context(args.repo, parent, commit, hunks) if args.repo else None
     hunk_retries = int(os.environ.get("SUMMARY_HUNK_RETRIES", "2"))
     for h in hunks:
         evidence = hunk_evidence(args.repo, parent, commit, h) if args.repo else None
+        evidence_by_hunk[h['idx']] = evidence
         prompt = TPL.format(file=h["file"], hunk=h["text"])
         prompt += "\n程序提取的语法事实：\n" + json.dumps(
             syntax_summary(evidence) if evidence else {"status": "source_refs_not_supplied"}, ensure_ascii=False)
-        obj = None
-        last_error = None
+        if scope_context:
+            prompt += '\n修改后的完整作用域（含关联 hunk 的最终修改）：\n' + json.dumps(
+                dict(scopes={key: scope_context['scopes'][key]
+                             for key in scope_context['by_hunk'].get(h['idx'], [])},
+                     diagnostic=scope_context['diagnostics'].get(h['idx'])), ensure_ascii=False)
+        tasks.append((h['idx'], prompt))
+
+    def summarize(prompt):
+        feedback = ''
         for attempt in range(hunk_retries + 1):
             try:
-                obj = call_json(key, model, prompt)
-                break
-            except Exception as e:  # noqa: BLE001
-                last_error = e
-                if attempt < hunk_retries:
-                    time.sleep(2)
-        if obj is None:
-            obj = {"kind": "unknown", "symbol": "", "param_change": "",
-                   "summary": "CALL_FAILED: %s" % last_error, "call_failed": True,
-                   "summary_attempts": hunk_retries + 1}
-        attach_syntax(obj, evidence)
-        obj["semantic_contract"] = normalize_contract(obj)
-        obj["hunk"] = h["idx"]
-        obj["file"] = h["file"]
-        rows.append(obj)
-        print("  %2d  %-9s %-32s %s" % (
-            h["idx"], obj.get("kind", "?"), (obj.get("symbol") or "-")[:32],
-            (obj.get("summary") or "")[:60]))
+                obj = call_json(key, model, prompt + feedback,
+                                request_options=options['request_options'], read_timeout=options['read_timeout'])
+                return validate_summary(obj)
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                if attempt == hunk_retries:
+                    raise
+                feedback = '\n上次输出未通过结构检查：%s。请重新输出完整语义契约，不要用空值掩盖遗漏。' % exc
+        raise ValueError('SUMMARY_HUNK_RETRIES must be nonnegative')
 
-    json.dump(rows, open(out, "w", encoding="utf-8", newline="\n"),
-              ensure_ascii=False, indent=2)
+    by_hunk = {h['idx']: h for h in hunks}
+    try:
+        for idx, obj, reused in run_tasks(tasks, summarize, checkpoint, validate_summary, options['workers']):
+            attach_syntax(obj, evidence_by_hunk[idx])
+            # New contracts have already passed strict validation. Do not run the
+            # legacy normalizer, which can coerce fields or truncate obligations.
+            obj.update(hunk=idx, file=by_hunk[idx]['file'])
+            rows.append(obj)
+            print('  %2d %-9s %s%s' % (idx, obj['kind'], '[cached] ' if reused else '', obj['summary'][:60]), flush=True)
+    except Exception as exc:
+        completed = {row['hunk'] for row in rows}
+        rows.extend(dict(hunk=h['idx'], file=h['file'], kind='unknown', call_failed=True,
+                         summary='stage incomplete: ' + str(exc))
+                    for h in hunks if h['idx'] not in completed)
+        write_json(out, sorted(rows, key=lambda row: row['hunk']))
+        sys.exit('SUMMARY_INFRA_FAILURE: %s; validated items retained in checkpoint' % exc)
+    rows.sort(key=lambda row: row['hunk'])
+    write_json(out, rows)
 
     # A failed summary must not become `unknown` and later look like a semantic
     # skip. The runner treats a non-zero exit as an infrastructure failure.

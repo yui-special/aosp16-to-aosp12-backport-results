@@ -694,7 +694,27 @@ class Child extends Base {}
         self.assertEqual(defs[0]['signature'], 'void reset(int user)')
         self.assertEqual(defs[0]['start'], 2)
 
+    def test_exact_old_mapping_does_not_delegate_location_for_prose_prerequisites(self):
+        mapper = script('backport_patch/cases/CVE-2025-48649/scripts/map_semantics.py')
+        summary = dict(det_enclosing='NewApi.reset',
+            source_structure=hunk_evidence(str(self.root), self.base, self.upstream, self.hunks[0]),
+            semantic_contract=dict(prerequisite_semantics=['permission reset mechanism']))
+        result = mapper.direct_mapping(str(self.root), self.target, self.hunks[0], summary)
+        self.assertEqual(result['mapping_basis'], 'verified_target_declarations')
+        self.assertEqual(result['prerequisite_status'], 'unverified')
+        self.assertEqual(result['required_prerequisites'], ['permission reset mechanism'])
+        self.assertEqual(result['mapping_type'], 'requires_prerequisite')
+        self.assertEqual(result['mappings'][0]['symbol'], 'Api.reset')
+        summary.pop('source_structure')
+        self.assertIsNone(mapper.direct_mapping(str(self.root), self.target, self.hunks[0], summary))
 
+    def test_mapping_supplies_real_method_ranges_for_broad_class_candidates(self):
+        mapper = script('backport_patch/cases/CVE-2025-48649/scripts/map_semantics.py')
+        scopes = mapper.mapping_scopes(str(self.root), self.target, 'Caller.java', ['reset'])
+        self.assertEqual([s['symbol'] for s in scopes], ['Caller.preferences'])
+        self.assertIn('preferences', scopes[0]['signature'])
+        self.assertGreater(scopes[0]['matched_lines'], 0)
+        self.assertEqual(mapper.mapping_scopes(str(self.root), self.target, 'Absent.java', ['reset']), [])
 
     def test_group_context_reuses_revision_scoped_queries_and_current_method_source(self):
         index = SymbolIndex(self.root)
@@ -717,6 +737,19 @@ class Child extends Base {}
         self.assertNotIn('void reset(int user)', updated)
         self.assertNotIn('"symbol": "Absent"', updated)
 
+    def test_mapping_type_lookup_uses_nested_declarations_not_filenames_or_comments(self):
+        mapper = script('backport_patch/cases/CVE-2025-48649/scripts/map_semantics.py')
+        self.write_commit({'Harness.java': 'class Harness { static class Builder {} }',
+                           'Pretend.java': 'class Different {} // class Pretend {}',
+                           'I.aidl': 'interface I {}'}, 'nested types')
+        self.assertTrue(mapper.type_declared(str(self.root), 'HEAD', 'Builder'))
+        self.assertFalse(mapper.type_declared(str(self.root), 'HEAD', 'Pretend'))
+        self.assertFalse(mapper.type_declared(str(self.root), 'HEAD', 'reset'))
+        with patch.dict(os.environ, {'SOURCE_STRUCTURE_CONFIG': ''}):
+            self.assertFalse(mapper.type_declared(str(self.root), 'HEAD', 'I'))
+        self.assertFalse(mapper.type_declared(str(self.root), self.target, 'Builder'))
+        (self.root/'Harness.java').write_text('uncommitted unrelated content')
+        self.assertTrue(mapper.type_declared(str(self.root), 'HEAD', 'Builder'))
 
     def test_summary_facts_override_model_labels_and_grouping_reuses_matching_evidence(self):
         client = script('summarize_and_group.py')
@@ -891,12 +924,16 @@ class Child extends Base {}
         source_patch, output = self.root/'input.patch', self.root/'summary.json'
         source_patch.write_text(self.patch_text)
 
-        def summarize(key, model, prompt):
-            facts = json.loads(prompt.split('程序提取的语法事实：\n', 1)[1])
+        def summarize(key, model, prompt, **kwargs):
+            facts, _ = json.JSONDecoder().raw_decode(prompt.split('程序提取的语法事实：\n', 1)[1])
+            self.assertIn('修改后的完整作用域', prompt)
             self.assertEqual(facts['signature_changes'][0]['old_types'], ['int'])
             self.assertEqual(facts['signature_changes'][0]['new_types'], ['int', 'boolean'])
+            contract = {k: '' if k in client.STRING_CONTRACT_FIELDS else [] for k in client.CONTRACT_FIELDS}
+            contract.update(goal='preserve reset', behavior='forward restore policy',
+                            enclosing_role='permission API', obligations=['forward policy'])
             return dict(kind='declare', summary='preserve reset behavior',
-                        symbol='inventedByModel', param_change='remove', semantic_contract={})
+                        symbol='inventedByModel', param_change='remove', semantic_contract=contract)
 
         with patch.object(client, 'call_json', side_effect=summarize) as llm, \
                 patch.object(sys, 'argv', ['summary', str(source_patch), str(output), 'fixture-model',
@@ -909,10 +946,104 @@ class Child extends Base {}
         self.assertEqual((result['symbol'], result['param_change']), ('reset', 'add'))
         self.assertEqual(result['source_structure']['after_ref'], self.upstream)
 
+    def test_summary_rejects_empty_contract_then_reuses_only_validated_result(self):
+        client = script('summarize_and_group.py')
+        source_patch, output = self.root/'input.patch', self.root/'summary.json'
+        source_patch.write_text(self.patch_text)
+        contract = {k: '' if k in client.STRING_CONTRACT_FIELDS else [] for k in client.CONTRACT_FIELDS}
+        contract.update(goal='reset', behavior='preserve policy', enclosing_role='permission API',
+                        obligations=['requirement %d' % n for n in range(20)])
+        good = dict(kind='declare', summary='reset policy', semantic_contract=contract)
+        argv = ['summary', str(source_patch), str(output), 'fixture-model', '--repo', str(self.root), '--commit', self.upstream]
+        env = {'DEEPSEEK_API_KEY': 'fixture', 'FRONTEND_OPTIONS': '{"workers":1}'}
+        with patch.object(sys, 'argv', argv), patch.dict(os.environ, env), patch('sys.stdout', new_callable=io.StringIO):
+            with patch.object(client, 'call_json', side_effect=[dict(kind='declare', summary='bad', semantic_contract={}), good]) as llm:
+                client.main()
+                self.assertEqual(llm.call_count, 2)
+                self.assertIn('未通过结构检查', llm.call_args.args[2])
+                self.assertEqual(llm.call_args.kwargs['request_options'], {'temperature': 0})
+            with patch.object(client, 'call_json', side_effect=AssertionError('cached request repeated')):
+                client.main()
+        self.assertEqual(len(json.loads(output.read_text())[0]['semantic_contract']['obligations']), 20)
 
+    def test_summary_schema_does_not_silently_coerce_invalid_fields(self):
+        client = script('summarize_and_group.py')
+        for value in [[], {}, {'kind': 'noise', 'summary': 'x', 'semantic_contract': {}},
+                      {'kind': 'logic', 'summary': 'x', 'semantic_contract': None}]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                client.validate_summary(value)
 
+    def test_mapping_stage_resumes_valid_groups_and_fresh_mode_repeats_the_request(self):
+        mapper = script('backport_patch/cases/CVE-2025-48649/scripts/map_semantics.py')
+        source_patch, summary, groups, output = [self.root/name for name in
+                                                ['input.patch', 'summary.json', 'groups.json', 'mapping.json']]
+        source_patch.write_text(self.patch_text)
+        summary.write_text(json.dumps([dict(hunk=0, file='Api.java', det_enclosing='RenamedApi.reset',
+            semantic_contract=dict(prerequisite_semantics=['permission reset mechanism'], obligations=['preserve policy']))]))
+        groups.write_text('[[0]]')
+        response = json.dumps({'hunk_mappings': [dict(hunk=0, mapping_type='direct', reason='existing API',
+            mappings=[dict(path='Api.java', symbol='Api.reset', evidence='existing declaration', covers=['preserve policy'])])]})
+        argv = ['mapping', str(self.root), self.target, str(source_patch), str(summary), str(groups), '-', str(output), 'fixture-model']
+        env = {'LLM_KEY': 'fixture', 'FRONTEND_OPTIONS': '{"workers":2}', 'SEMANTIC_MAP_OFFLINE': '0'}
+        with patch.object(sys, 'argv', argv), patch.dict(os.environ, env), patch('sys.stdout', new_callable=io.StringIO):
+            with patch.object(mapper, 'call_llm', return_value=response) as llm:
+                mapper.main()
+                self.assertEqual(llm.call_count, 1)
+                first = json.loads(output.read_text())
+                mapper.main()
+                self.assertEqual(llm.call_count, 1)
+                self.assertEqual(json.loads(output.read_text()), first)
+                with patch.dict(os.environ, {'FRONTEND_OPTIONS': '{"resume":false}'}):
+                    mapper.main()
+                self.assertEqual(llm.call_count, 2)
 
+    def test_mapping_retry_preserves_valid_rows_and_only_requests_unresolved_hunks(self):
+        mapper = script('backport_patch/cases/CVE-2025-48649/scripts/map_semantics.py')
+        source_patch, summary, groups, output = [self.root/name for name in
+            ['partial.patch', 'partial-summary.json', 'partial-groups.json', 'partial-mapping.json']]
+        source_patch.write_text(self.patch_text + self.patch_text)
+        summary.write_text(json.dumps([dict(hunk=i, file='Api.java', det_enclosing='RenamedApi.reset',
+            semantic_contract=dict(obligations=['preserve policy'])) for i in (0, 1)]))
+        groups.write_text('[[0,1]]')
+        valid = dict(hunk=0, mapping_type='direct', reason='first verified mapping', mappings=[dict(
+            path='Api.java', symbol='Api.reset', evidence='existing declaration', covers=['preserve policy'])])
+        unresolved = dict(hunk=1, mapping_type='unresolved', reason='need a target method', mappings=[])
+        argv = ['mapping', str(self.root), self.target, str(source_patch), str(summary), str(groups), '-', str(output), 'fixture-model']
+        env = {'LLM_KEY': 'fixture', 'FRONTEND_OPTIONS': '{"workers":1,"resume":false}', 'SEMANTIC_MAP_OFFLINE': '0'}
+        for repaired in (False, True):
+            last = dict(valid, hunk=1, reason='repaired mapping') if repaired else unresolved
+            responses = [json.dumps({'hunk_mappings': [valid, unresolved]}), json.dumps({'hunk_mappings': [
+                dict(valid, reason='must not overwrite retained mapping'), last]})]
+            with self.subTest(repaired=repaired), patch.object(sys, 'argv', argv), patch.dict(os.environ, env), \
+                    patch('sys.stdout', new_callable=io.StringIO), \
+                    patch.object(mapper, 'call_llm', side_effect=responses) as llm:
+                mapper.main()
+            prompts = [call.args[2] for call in llm.call_args_list]
+            self.assertEqual(len(prompts), 2)
+            self.assertEqual(re.findall(r'=== HUNK (\d+) ===', prompts[0]), ['0', '1'])
+            self.assertEqual(re.findall(r'=== HUNK (\d+) ===', prompts[1]), ['1'])
+            self.assertIn('RETAINED MAPPINGS', prompts[1])
+            mappings = json.loads(output.read_text())['groups'][0]['hunk_mappings']
+            self.assertEqual([m['hunk'] for m in mappings], [0, 1])
+            self.assertEqual(mappings[0]['reason'], valid['reason'])
+            self.assertEqual(mappings[1]['mapping_type'], 'direct' if repaired else 'unresolved')
 
+    def test_triage_resume_reuses_initial_decision_but_preserves_dependency_processing(self):
+        triage = script('triage.py')
+        source_patch, summary, output = [self.root/name for name in ['input.patch', 'summary.json', 'triaged.json']]
+        source_patch.write_text(self.patch_text)
+        summary.write_text(json.dumps([dict(hunk=0, file='Api.java', kind='declare',
+            source_structure=hunk_evidence(str(self.root), self.base, self.upstream, self.hunks[0]))]))
+        argv = ['triage', str(source_patch), str(summary), 'permission fix', str(output), 'fixture-model', str(self.root), self.target]
+        with patch.object(sys, 'argv', argv), patch.dict(os.environ, {'LLM_KEY': 'fixture', 'FRONTEND_OPTIONS': '{}'}), \
+                patch('sys.stdout', new_callable=io.StringIO), \
+                patch.object(triage, 'call', return_value=dict(port=True, category='fix', reason='API fix')) as llm:
+            triage.main()
+            first = json.loads(output.read_text())
+            triage.main()
+        self.assertEqual(llm.call_count, 1)
+        self.assertEqual(json.loads(output.read_text()), first)
+        self.assertEqual(first[0]['dependency_status'], 'complete')
 
     def test_mapping_rejects_call_occurrence_and_preserves_actual_declaration(self):
         mapper = script('backport_patch/cases/CVE-2025-48649/scripts/map_semantics.py')

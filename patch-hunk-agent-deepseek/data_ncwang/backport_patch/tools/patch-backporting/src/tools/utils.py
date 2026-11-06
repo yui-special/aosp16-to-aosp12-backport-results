@@ -541,6 +541,7 @@ def dump_merged_hunks(merged, out_dir: str):
                 "files": g["files"],
                 "hints": g.get("hints", ""),
                 "target_symbols": g.get("target_symbols", []),
+                "target_locations": g.get("target_locations", []),
                 "mapping_status": g.get("mapping_status", []),
                 "strict_requires_patch": bool(g.get("strict_requires_patch", False)),
             }
@@ -645,6 +646,7 @@ def load_merged_hunk_files(dir_path: str, index_name: str = "index.json"):
                 "files": m.get("files", patch_files),
                 "hints": m.get("hints", ""),
                 "target_symbols": m.get("target_symbols", []),
+                "target_locations": m.get("target_locations", []),
                 "mapping_status": m.get("mapping_status", []),
                 "strict_requires_patch": bool(m.get("strict_requires_patch", False)),
                 "text": text,

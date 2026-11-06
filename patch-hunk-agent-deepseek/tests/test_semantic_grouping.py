@@ -228,14 +228,74 @@ class A {
         payload['signature_reviews'][0]['rejected_calls'] = [{'hunk': 12, 'reason': 'different receiver overload'}]
         self.assertEqual([p['hunks'] for p in self.module.plan_from_relations(payload, inputs)], [[4, 8], [12]])
 
-    def test_local_reviews_cannot_silently_omit_a_late_assertion(self):
+    def test_mechanical_signature_adaptation_cannot_be_rejected(self):
+        inputs = {'hunks': [{'hunk': h} for h in [4, 8, 12]], 'parameter_prerequisites': [],
+                  'anchors': [{'id': 'S1', 'kind': 'signature', 'name': 'send', 'members': [4, 8, 12],
+                               'definitions': [{'hunk': 4}], 'calls': [
+                                   {'hunk': 8, 'mechanical_binding': True}, {'hunk': 12}]}]}
+        payload = {'signature_reviews': [{'anchor': 'S1', 'calls': [12],
+                   'rejected_calls': [{'hunk': 8, 'reason': 'contradicts the direct adaptation'}]}]}
+        with self.assertRaisesRegex(ValueError, 'mechanically adapted signature calls'):
+            self.module.plan_from_relations(payload, inputs)
+        payload['signature_reviews'][0].update(calls=[8, 12], rejected_calls=[])
+        plan = self.module.plan_from_relations(payload, inputs)
+        self.assertEqual([p['hunks'] for p in plan], [[4, 8, 12]])
+
+    def test_locked_signature_calls_are_not_rereviewed(self):
+        summaries = [{'hunk': h, 'file': 'A.java', 'source_structure': {}} for h in [4, 8, 12]]
+        hunks = [{'idx': h, 'text': '+change'} for h in [4, 8, 12]]
+        inputs = {'hunks': [{'hunk': h, 'file': 'A.java', 'diff': '+change',
+                            'source_structure': self.module.compact_structure({})} for h in [4, 8, 12]],
+                  'parameter_prerequisites': [], 'anchors': [
+                      {'id': 'S1', 'kind': 'signature', 'name': 'send', 'members': [4, 8, 12],
+                       'definitions': [{'hunk': 4}], 'calls': [
+                           {'hunk': 8, 'mechanical_binding': True}, {'hunk': 12}]}]}
+        ask = Mock(side_effect=[{'calls': [12], 'rejected_calls': []},
+                                {'reference_reviews': [], 'test_reviews': [], 'requires': []}])
+        with patch.object(self.module, 'relation_inputs', return_value=inputs):
+            plan = self.module.semantic_groups(summaries, hunks, [], [], ask)
+        data = json.loads(ask.call_args_list[0].args[0].rsplit('\n', 1)[-1])
+        self.assertEqual(data['anchor']['calls'], [{'hunk': 12}])
+        self.assertEqual([p['hunks'] for p in plan], [[4, 8, 12]])
+
+    def test_external_receiver_signature_adaptation_is_not_mechanical_binding(self):
+        def evidence(calls=((), ()), changes=()):
+            return {'before': {'path': 'A.java', 'status': 'ok', 'scopes': [], 'calls': calls[0], 'declarations': []},
+                    'after': {'path': 'A.java', 'status': 'ok', 'scopes': [], 'calls': calls[1], 'declarations': []},
+                    'signature_changes': list(changes)}
+        change = {'name': 'clear', 'kind': 'replacement', 'scope': 'A.clear',
+                  'before': 'void clear(String p, int u)',
+                  'after': 'void clear(String p, int u, boolean restore)',
+                  'old_types': ['String', 'int'], 'new_types': ['String', 'int', 'boolean'],
+                  'added_parameters': ['restore']}
+        old_call = {'expression': 'pm.clear(pkg, user)', 'callee': 'clear', 'receiver': 'pm',
+                    'arguments': ['pkg', 'user'], 'line': 8, 'parse_error': False}
+        new_call = {'expression': 'pm.clear(pkg, user, restore)', 'callee': 'clear', 'receiver': 'pm',
+                    'arguments': ['pkg', 'user', 'restore'], 'line': 8, 'parse_error': False}
+        records = [
+            {'hunk': 4, 'file': 'A.java', 'source_structure': evidence(changes=[change])},
+            {'hunk': 8, 'file': 'A.java', 'source_structure': evidence(calls=([old_call], [new_call]))},
+        ]
+        hunks = [{'idx': 4, 'text': '-old\n+new'}, {'idx': 8, 'text': '-old\n+new'}]
+        anchors = self.module.relation_inputs(records, hunks)['anchors']
+        signature = next(a for a in anchors if a['kind'] == 'signature')
+        self.assertEqual(signature['calls'][0]['mechanical_binding'], False)
+
+    def test_local_reviews_require_source_evidence_and_cannot_omit_a_member(self):
         inputs = {'hunks': [{'hunk': h} for h in [10, 20, 50]], 'parameter_prerequisites': [],
                   'anchors': [{'id': 'L1', 'kind': 'local', 'members': [10, 20, 50]}]}
         payload = {'local_reviews': [{'anchor': 'L1', 'units': [
-            {'hunks': [10, 20], 'reason': 'limit declaration and clamp'}]}]}
+            {'hunks': [10], 'reason': 'independent declaration'},
+            {'hunks': [20], 'reason': 'independent clamp'}]}]}
         with self.assertRaisesRegex(ValueError, 'partition every member'):
             self.module.plan_from_relations(payload, inputs)
-        payload['local_reviews'][0]['units'][0]['hunks'].append(50)
+        payload['local_reviews'][0]['units'] = [
+            {'hunks': [10, 20, 50], 'reason': 'parallel changes in one scope'}]
+        with self.assertRaisesRegex(ValueError, 'local binding needs mechanical source evidence'):
+            self.module.plan_from_relations(payload, inputs)
+        inputs['anchors'][0]['source_bindings'] = [
+            {'hunks': [10, 20], 'reason': 'declaration feeds clamp'},
+            {'hunks': [20, 50], 'reason': 'clamp feeds assertion'}]
         plan = self.module.plan_from_relations(payload, inputs)
         self.assertEqual([p['hunks'] for p in plan], [[10, 20, 50]])
 

@@ -45,6 +45,37 @@ class TriageRelevanceTests(unittest.TestCase):
         self.assertTrue(row['needs_semantic_mapping'])
         self.assertNotIn('func_in_target', row)
 
+    def test_pure_aconfig_cleanup_is_decided_without_a_model(self):
+        hunks = [
+            {'idx': 0, 'file': 'windowing_frontend.aconfig', 'text':
+                '@@ -1 +1 @@\n-flag {\n-    name: "keep_app_window_hide_while_locked"\n-    is_fixed_read_only: true'},
+            {'idx': 1, 'file': 'WindowState.java', 'text':
+                '@@ -1 +1 @@\n-if (keepAppWindowHideWhileLocked()) action();\n+action();'},
+        ]
+        with patch.object(triage, 'git_count', return_value=2):
+            decision = triage.mechanical_triage_decision(hunks[0], hunks, '/repo', 'base')
+        self.assertIs(decision['port'], False)
+        self.assertEqual(decision['category'], 'metadata')
+        self.assertEqual(decision['decision_source'], 'deterministic_config_cleanup')
+        self.assertEqual(decision['config_evidence']['target_occurrences'],
+                         {'keep_app_window_hide_while_locked': 2, 'keepAppWindowHideWhileLocked': 2})
+        self.assertIsNone(triage.mechanical_triage_decision(hunks[1], hunks, '', ''))
+        self.assertIsNone(triage.mechanical_triage_decision(hunks[0], hunks[:1], '', ''))
+
+        rows = [dict(hunk=0, port=False, initial_decision=decision),
+                dict(hunk=1, port=True, category='fix', reason='behavior')]
+        summaries = [{'hunk': 0}, {'hunk': 1}]
+        from tools.hunk_dependencies import review_inputs, validate_review
+        inputs = review_inputs(rows, hunks, summaries)
+        answer = {'reviews': [
+            {'hunk': 0, 'reason': 'cleanup follows behavior', 'requires': []},
+            {'hunk': 1, 'reason': 'wrong reversed dependency', 'requires': [
+                {'provider': 0, 'reason': 'incorrectly requires cleanup first',
+                 'provider_evidence': {'side': 'before', 'quote': 'name: "keep_app_window_hide_while_locked"'},
+                 'consumer_evidence': {'side': 'after', 'quote': 'action();'}}]}]}
+        with self.assertRaisesRegex(ValueError, 'config cleanup cannot be a prerequisite'):
+            validate_review(answer, inputs)
+
     def test_failed_model_decision_is_not_fabricated_from_keyword_hits(self):
         row = self.run_postprocess(None, {'@Rule': 10})
         self.assertIsNone(row['port'])

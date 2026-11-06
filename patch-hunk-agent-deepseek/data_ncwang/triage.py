@@ -11,6 +11,7 @@ review_required=True 只表示同名符号值得复核，不改变 port 决定�
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -18,7 +19,10 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "backport_patch/tools/patch-backporting/src"))
 from tools.utils import split_patch_indexed  # noqa: E402
-from tools.hunk_dependencies import (fingerprint, review_dependencies, syntax_prerequisites)  # noqa: E402
+from tools.hunk_dependencies import (canonical_prerequisites, fingerprint, mechanical_prerequisites,
+                                     review_dependencies)  # noqa: E402
+from tools import hunk_dependencies, source_structure
+from tools.frontend import Checkpoint, implementation_id, run_tasks, stage_options, write_json
 
 LEGACY_SYMBOL_CLOSURE_SUFFIX = " | 符号闭包："
 
@@ -33,6 +37,8 @@ CVE 描述：{desc}
 修复逻辑及其必要测试需要映射到目标的等价实现。纯粹为上游测试管理功能开关的
 Rule 或测试运行器若仅服务上游设施且与修复及其验证无关，应判 unrelated。
 必要导入、声明、初始化、测试预期依赖的输出也属于 fix，不能因没有独立修复行为就跳过。
+安全修复对同一 API 新增或收紧权限、安全契约注解时，必须结合语义契约判断；
+不得仅因注解不改变运行时行为就判 unrelated。
 kind/symbol 只是摘要线索，noise 不等于 metadata。
 移除开关条件可能改变安全行为；删除已无引用的开关声明属于独立清理，不自动成为修复前提。
 分诊不猜测目标是否具有某个类名，也不把目标不存在上游设施当作跳过修复的理由。
@@ -57,8 +63,9 @@ patch 内容：
 def call(key, model, prompt, *, dependency=False):
     # Share response/error handling with the summary stage; options are external.
     from summarize_and_group import call_json
-    options = os.environ.get("TRIAGE_REQUEST_OPTIONS", '{"temperature":0}')
-    timeout = os.environ.get("TRIAGE_READ_TIMEOUT", "60")
+    configured = stage_options('triage')
+    options = json.dumps(configured['request_options'])
+    timeout = configured['read_timeout']
     if dependency:
         options = os.environ.get("TRIAGE_DEPENDENCY_REQUEST_OPTIONS", options)
         timeout = os.environ.get("TRIAGE_DEPENDENCY_READ_TIMEOUT",
@@ -94,6 +101,47 @@ def git_count(repo, ref, name, path=None):
         return len(p.stdout.strip().splitlines())
 
 
+def _changed_lines(hunk, marker):
+    return [line[1:] for line in hunk["text"].splitlines()
+            if line.startswith(marker) and not line.startswith(marker * 3)]
+
+
+def _flag_names(name):
+    parts = name.split("_")
+    return [name, parts[0] + "".join(part.capitalize() for part in parts[1:])]
+
+
+def mechanical_triage_decision(hunk, hunks, repo, target_ref):
+    """Prove an independent aconfig cleanup without interpreting model prose."""
+    if not hunk.get("file", "").endswith(".aconfig") or _changed_lines(hunk, "+"):
+        return None
+    removed = _changed_lines(hunk, "-")
+    names = re.findall(r'\bname\s*:\s*"([A-Za-z_]\w*)"', "\n".join(removed))
+    if len(names) != 1:
+        return None
+    flag = names[0]
+    variants = _flag_names(flag)
+    removed_reference = False
+    for other in hunks:
+        if other is hunk or other.get("file", "").endswith(".aconfig"):
+            continue
+        old = "\n".join(_changed_lines(other, "-"))
+        new = "\n".join(_changed_lines(other, "+"))
+        if any(re.search(r"\b" + re.escape(name) + r"\b", old)
+               and not re.search(r"\b" + re.escape(name) + r"\b", new)
+               for name in variants):
+            removed_reference = True
+            break
+    if not removed_reference:
+        return None
+    evidence = {"flag": flag, "reference_names": variants,
+                "target_occurrences": {name: git_count(repo, target_ref, name)
+                                       for name in variants} if repo and target_ref else {}}
+    return {"port": False, "category": "metadata",
+            "reason": "纯 aconfig 开关声明清理；代码引用已由其他 hunk 移除，行为修复不依赖该声明",
+            "decision_source": "deterministic_config_cleanup", "config_evidence": evidence}
+
+
 def postprocess(rows, hunks, summaries, repo, target_ref, reviews=None):
     """Close only evidenced prerequisites; summary names never select hunks."""
     by_id = {r["hunk"]: r for r in rows}
@@ -106,7 +154,10 @@ def postprocess(rows, hunks, summaries, repo, target_ref, reviews=None):
                     "reason": reason.split(LEGACY_SYMBOL_CLOSURE_SUFFIX, 1)[0],
                 }
             else:
-                row["initial_decision"] = {k: row.get(k) for k in ("port", "category", "reason")}
+                row["initial_decision"] = {
+                    **{k: row.get(k) for k in ("port", "category", "reason")},
+                    **{k: row[k] for k in ("decision_source", "config_evidence") if k in row},
+                }
         row.update(row["initial_decision"])
         row.pop("func_in_target", None)
         row.pop("semantic_candidates", None)
@@ -115,18 +166,21 @@ def postprocess(rows, hunks, summaries, repo, target_ref, reviews=None):
         row.pop("dependency_status", None)
         row["retained_by"] = []
         row.update(review_required=False, closure_symbols=[], review_reason="")
-    edges = syntax_prerequisites(summaries)
+    edges = mechanical_prerequisites(summaries, hunks)
     if reviews is not None:
-        edges += [{**edge, "consumer": consumer, "kind": "reviewed_prerequisite"}
+        edges += [{**edge, "consumer": consumer, "kind": edge.get("kind", "reviewed_prerequisite")}
                   for consumer, review in reviews.items() for edge in review["requires"]]
     unique = {}
     for edge in edges:
-        unique.setdefault((edge["provider"], edge["consumer"], edge["reason"]), edge)
-    edges = list(unique.values())
+        unique.setdefault((edge["provider"], edge["consumer"], edge["reason"],
+                           edge.get("retain_consumer", False)), edge)
+    edges = canonical_prerequisites(list(unique.values()))
     # Monotonic worklist, with no arbitrary closure-depth limit.
-    incoming = {}
+    incoming, outgoing = {}, {}
     for edge in edges:
         incoming.setdefault(edge["consumer"], []).append(edge)
+        if edge.get("retain_consumer") is True:
+            outgoing.setdefault(edge["provider"], []).append(edge)
     pending = sorted(h for h, row in by_id.items() if row.get("port") is True)
     visited = set()
     while pending:
@@ -144,12 +198,21 @@ def postprocess(rows, hunks, summaries, repo, target_ref, reviews=None):
                 row.update(port=True, category="fix", reason=(row.get("reason") or "") +
                            " | 被 hunk %d 依赖：%s" % (consumer, edge["reason"]))
                 pending.append(row["hunk"])
+        for edge in outgoing.get(consumer, []):
+            row = by_id[edge["consumer"]]
+            if row.get("port") is None:
+                continue
+            row["retained_by"].append(edge)
+            if row.get("port") is not True:
+                row.update(port=True, category="fix", reason=(row.get("reason") or "") +
+                           " | hunk %d 的已选修复要求同步修改：%s" % (consumer, edge["reason"]))
+                pending.append(row["hunk"])
     for row in rows:
         row["needs_semantic_mapping"] = row.get("port") is True
         row["triage_state"] = ("port_required" if row.get("port") is True else
                                "not_required" if row.get("port") is False else "undecided")
     # Same-name evidence is a review hint only. Actual retention remains governed
-    # by the scoped syntax/reviewed prerequisites above, with no closure-depth cap.
+    # by the mechanical/behavioral prerequisites above, with no closure-depth cap.
     by_symbol = {}
     for i, summary in enumerate(summaries):
         symbol = summary.get("symbol")
@@ -169,13 +232,8 @@ def postprocess(rows, hunks, summaries, repo, target_ref, reviews=None):
         for summary in summaries:
             h = summary["hunk"]
             row = by_id[h]
-            # Include syntax edges too, so grouping receives exactly the same DAG.
-            review = {**reviews[h], "requires": list(reviews[h]["requires"])}
-            seen = {e["provider"] for e in review["requires"]}
-            for edge in incoming.get(h, []):
-                if edge["provider"] not in seen:
-                    review["requires"].append(edge)
-                    seen.add(edge["provider"])
+            # Store the same canonical DAG used by closure and grouping.
+            review = {**reviews[h], "requires": list(incoming.get(h, []))}
             row["dependency_review"] = review
             row["dependency_fingerprint"] = fingerprint(summary, by_hunk[h])
             row["dependency_status"] = "complete"
@@ -188,6 +246,8 @@ def main():
              else os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"))
     repo = sys.argv[6] if len(sys.argv) > 6 else ""
     target_ref = sys.argv[7] if len(sys.argv) > 7 else ""
+    if repo and target_ref:
+        target_ref = source_structure.resolve_ref(repo, target_ref)
     key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("LLM_KEY", "")
     post_only = os.environ.get("TRIAGE_POST_ONLY") == "1"
     if not key and not post_only:
@@ -207,6 +267,15 @@ def main():
                  (failed_summaries[:20], summary_failure_limit))
 
     rows = json.loads(Path(out_path).read_text(encoding="utf-8")) if post_only else []
+    options = stage_options('triage')
+    checkpoint = Checkpoint(out_path, dict(stage='triage', patch=text, summaries=summaries, desc=desc,
+        repo=os.path.realpath(repo) if repo else '', target=target_ref, model=model,
+        endpoint=os.environ.get('LLM_BASE_URL', 'https://api.deepseek.com/v1'),
+        request_options=options['request_options'], parser=source_structure.settings(),
+        implementation=implementation_id(__file__, hunk_dependencies.__file__, source_structure.__file__,
+                                        Path(__file__).with_name('summarize_and_group.py'))), options['resume'])
+    if not post_only:
+        Path(out_path).unlink(missing_ok=True)
     cached_reviews = None
     if post_only:
         print("post-only：复用已有 LLM 判断，只跑后处理")
@@ -214,6 +283,7 @@ def main():
         attach_reviews(summaries, hunks, rows)
         if all("dependency_review" in r for r in rows):
             cached_reviews = {r["hunk"]: r["dependency_review"] for r in rows}
+    tasks = []
     for r, h in ([] if post_only else zip(summaries, hunks)):
         prompt = TPL.format(
             desc=desc, file=h["file"], summary=r.get("summary", ""),
@@ -223,30 +293,40 @@ def main():
             structure=json.dumps(r.get("source_structure", {}), ensure_ascii=False),
             diff=h["text"],
         )
-        obj = None
+        obj = mechanical_triage_decision(h, hunks, repo, target_ref)
+        if obj is not None:
+            validate_decision(obj)
+            obj.update(hunk=r['hunk'], file=h['file'])
+            rows.append(obj)
+        else:
+            tasks.append((r['hunk'], prompt))
+
+    def decide(prompt):
+        feedback = ''
         for attempt in range(3):
             try:
-                obj = validate_decision(call(key, model, prompt))
-                break
-            except RuntimeError as e:
-                # Transport/client retries have already been exhausted. Do not
-                # repeat a failed account/request across every remaining hunk.
-                obj = {"port": None, "category": "unknown", "reason": str(e)}
-                break
+                return validate_decision(call(key, model, prompt + feedback))
             except (ValueError, TypeError, KeyError, AttributeError, TimeoutError) as e:
+                if attempt == 2:
+                    raise
                 print("  retry %d: %s" % (attempt + 1, e), file=sys.stderr)
-                time.sleep(3)
-        if obj is None:
-            obj = {"port": None, "category": "unknown", "reason": "parse failed"}
-        obj["hunk"] = r["hunk"]
-        obj["file"] = h["file"]
-        rows.append(obj)
-        print("  %2d %-5s %-10s %s" % (
-            obj["hunk"], "PORT" if obj["port"] is True else "skip" if obj["port"] is False else "FAIL",
-            obj.get("category", ""), (obj.get("reason") or "")[:50]))
-        if obj["port"] is None:
-            Path(out_path).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-            sys.exit("TRIAGE_INFRA_FAILURE: unresolved hunk %d" % obj["hunk"])
+                feedback = '\n上次判断未通过检查：%s。重新输出符合要求的 JSON。' % e
+
+    by_hunk = {h['idx']: h for h in hunks}
+    try:
+        for idx, obj, reused in run_tasks(tasks, decide, checkpoint, validate_decision, options['workers']):
+            obj.update(hunk=idx, file=by_hunk[idx]['file'])
+            rows.append(obj)
+            print('  %2d %-5s %s%s' % (idx, 'PORT' if obj['port'] else 'skip',
+                  '[cached] ' if reused else '', obj['reason'][:50]), flush=True)
+    except Exception as exc:
+        completed = {row['hunk'] for row in rows}
+        rows.extend(dict(hunk=h['idx'], file=h['file'], port=None, category='unknown',
+                         reason='stage incomplete: ' + str(exc))
+                    for h in hunks if h['idx'] not in completed)
+        write_json(out_path, sorted(rows, key=lambda row: row['hunk']))
+        sys.exit('TRIAGE_INFRA_FAILURE: %s; validated items retained in checkpoint' % exc)
+    rows.sort(key=lambda row: row['hunk'])
 
     # Save initial decisions even if dependency review fails; no unknown decision
     # can silently become a skip or be hidden by closure.
@@ -255,7 +335,7 @@ def main():
             row.update(row["initial_decision"])
         if not post_only:
             row["dependency_status"] = "pending"
-    Path(out_path).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(out_path, rows)
     failed = [r["hunk"] for r in rows if type(r.get("port")) is not bool]
     if failed:
         sys.exit("TRIAGE_INFRA_FAILURE: unresolved hunks %s" % failed)
@@ -267,7 +347,7 @@ def main():
             retries=max(0, int(os.environ.get("TRIAGE_DEPENDENCY_RETRIES", "1"))))
     postprocess(rows, hunks, summaries, repo, target_ref, reviews)
 
-    Path(out_path).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(out_path, rows)
     n_port = sum(1 for x in rows if x.get("port") is True)
     n_skip = sum(1 for x in rows if x.get("port") is False)
     n_review = sum(1 for x in rows if x.get("port") is False and x.get("review_required"))
